@@ -1,0 +1,103 @@
+name: Build OpenWrt‑25.12 x86_64 FullCone‑All
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build_firmware:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup OpenWrt build env
+        uses: openwrt/actions-setup-buildenv@v1
+
+      - name: Clone OpenWrt 25.12
+        run: |
+          git clone https://git.openwrt.org/openwrt/openwrt.git openwrt
+          cd openwrt
+          git checkout openwrt-25.12
+
+      - name: Pull third‑party packages
+        run: |
+          cd openwrt
+          # nft‑fullcone feed
+          echo "src-git nftfullcone https://github.com/fullcone-n/nft-fullcone.git" >> feeds.conf.default
+          # ddns‑go 拉取到package目录
+          git clone https://github.com/sirpdboy/luci-app-ddns-go.git package/luci-app-ddns-go
+          # ddnsto 官方openwrt包
+          git clone https://github.com/linkease/ddnsto-openwrt-package.git package/ddnsto
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Generate .config
+        run: |
+          cd openwrt
+          make defconfig
+          ## Target x86_64 Generic
+          echo "CONFIG_TARGET_x86=y" >> .config
+          echo "CONFIG_TARGET_x86_64=y" >> .config
+          echo "CONFIG_TARGET_x86_64_Generic=y" >> .config
+
+          ## nft‑fullcone FullCone NAT
+          echo "CONFIG_PACKAGE_nft-fullcone=y" >> .config
+
+          ## Base LuCI 中文汉化
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+          echo "CONFIG_PACKAGE_luci-base=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y" >> .config
+
+          ## ttyd 网页终端
+          echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
+
+          ## UPnP nftables
+          echo "CONFIG_PACKAGE_miniupnpd-nftables=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-upnp=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y" >> .config
+
+          ## ddns‑scripts cloudflare dnspod
+          echo "CONFIG_PACKAGE_ddns-scripts=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
+          echo "CONFIG_PACKAGE_ddns-scripts-cloudflare=y" >> .config
+          echo "CONFIG_PACKAGE_ddns-scripts-dnspod=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y" >> .config
+
+          ## curl ca证书
+          echo "CONFIG_PACKAGE_curl=y" >> .config
+          echo "CONFIG_PACKAGE_ca-certificates=y" >> .config
+
+          ## uhttpd
+          echo "CONFIG_PACKAGE_luci-app-uhttpd=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y" >> .config
+
+          ## 温度统计 collectd thermal
+          echo "CONFIG_PACKAGE_luci-app-statistics=y" >> .config
+          echo "CONFIG_PACKAGE_collectd-mod-thermal=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-thermal=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-hwmon-core=y" >> .config
+
+          ## ddns‑go
+          echo "CONFIG_PACKAGE_ddns-go=y" >> .config
+          ## ddnsto
+          echo "CONFIG_PACKAGE_ddnsto=y" >> .config
+
+          ## 关闭多余镜像节约空间
+          echo "CONFIG_TARGET_x86_64_Generic_GRUB_EFI_IMG=n" >> .config
+
+          make oldconfig
+
+      - name: Download sources
+        run: cd openwrt && make download -j$(nproc)
+
+      - name: Compile firmware
+        run: cd openwrt && make -j$(nproc)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt‑25.12‑x86‑64‑fullcone‑all
+          path: openwrt/bin/targets/x86/64/*.img.gz
