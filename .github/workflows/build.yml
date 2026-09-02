@@ -1,4 +1,4 @@
-name: Build OpenWrt‑25.12 x86_64 SONIC‑FullCone‑UI‑82579FIX
+name: Build OpenWrt‑25.12 x86_64 FullCone‑Complete
 on:
   workflow_dispatch:
   push:
@@ -11,27 +11,27 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v5
 
-      - name: Install OpenWrt build dependencies
+      - name: Install build dependencies
         run: |
           sudo apt update
           sudo apt install -y build-essential clang flex bison g++ gawk \
           gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
           python3-distutils python3-setuptools rsync swig unzip zlib1g-dev file wget curl ca-certificates automake libtool
 
-      - name: Clone OpenWrt 25.12 official source
+      - name: Clone OpenWrt openwrt‑25.12 branch
         run: |
           git clone https://git.openwrt.org/openwrt/openwrt.git openwrt
           cd openwrt
           git checkout openwrt-25.12
 
-      - name: Apply sonic‑fullcone patch (kernel/firewall4/luci ui switch)
+      - name: Apply sonic‑fullcone patch(FullCone NAT + LuCI switch)
         run: |
           cd openwrt
           git clone https://github.com/mufeng05/openwrt-sonic-fullcone.git temp_sonic_fullcone
           bash temp_sonic_fullcone/add_sonic_fullcone.sh
           rm -rf temp_sonic_fullcone
 
-      - name: Pull third‑party packages
+      - name: Import third‑party packages
         run: |
           cd openwrt
           git clone https://github.com/sirpdboy/luci-app-ddns-go.git package/luci-app-ddns-go
@@ -45,54 +45,58 @@ jobs:
           echo "CONFIG_TARGET_x86=y" >> .config
           echo "CONFIG_TARGET_x86_64=y" >> .config
           echo "CONFIG_TARGET_x86_64_Generic=y" >> .config
-          # Intel 82574L igb / 82579LM e1000e
+          #网卡驱动 82574L igb /82579LM e1000e
           echo "CONFIG_PACKAGE_kmod-igb=y" >> .config
           echo "CONFIG_PACKAGE_kmod-e1000e=y" >> .config
           echo "CONFIG_PACKAGE_kmod-i40e=y" >> .config
           echo "CONFIG_PACKAGE_kmod-ice=y" >> .config
           echo "CONFIG_PACKAGE_kmod-r8125=y" >> .config
-          # Base LuCI 中文汉化
+          #LuCI基础中文
           echo "CONFIG_PACKAGE_luci=y" >> .config
           echo "CONFIG_PACKAGE_luci-base=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y" >> .config
-          # ttyd网页终端
+          #ttyd网页终端
           echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
-          # UPnP nftables
+          #UPnP
           echo "CONFIG_PACKAGE_miniupnpd-nftables=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-upnp=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y" >> .config
-          # ddns‑scripts cloudflare dnspod
+          #原生DDNS dnspod
           echo "CONFIG_PACKAGE_ddns-scripts=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
           echo "CONFIG_PACKAGE_ddns-scripts-cloudflare=y" >> .config
           echo "CONFIG_PACKAGE_ddns-scripts-dnspod=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y" >> .config
-          # curl ca证书
+          #curl ca证书
           echo "CONFIG_PACKAGE_curl=y" >> .config
           echo "CONFIG_PACKAGE_ca-certificates=y" >> .config
-          # uhttpd
-          echo "CONFIG_PACKAGE_luci-app-uhttpd=y" >> .config
+          #uhttpd中文翻译
           echo "CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y" >> .config
-          #温度统计 collectd thermal
+          #温度统计
           echo "CONFIG_PACKAGE_luci-app-statistics=y" >> .config
           echo "CONFIG_PACKAGE_collectd-mod-thermal=y" >> .config
           echo "CONFIG_PACKAGE_kmod-thermal=y" >> .config
           echo "CONFIG_PACKAGE_kmod-hwmon-core=y" >> .config
-          # ddns‑go
+          #ddns‑go
           echo "CONFIG_PACKAGE_ddns-go=y" >> .config
-          #关闭多余镜像节约编译体积
+          echo "CONFIG_PACKAGE_luci-app-ddns-go=y" >> .config
+          #关闭多余镜像
           echo "CONFIG_TARGET_x86_64_Generic_GRUB_EFI_IMG=n" >> .config
+
           make oldconfig
 
-      - name: Download sources
+          #打印关键配置，CI日志直接查看是否选中
+          grep -E "(CONFIG_PACKAGE|CONFIG_TARGET)" .config | grep -E "(ddns|ttyd|upnp|statistics|thermal|curl|ca-cert)"
+
+      - name: Download source
         run: cd openwrt && make download -j$(nproc)
 
       - name: Compile firmware
-        run: cd openwrt && make -j$(nproc)
+        run: cd openwrt && make -j$(nproc) V=s
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
-          name: OpenWrt‑25.12‑x86‑64‑82579lm‑fixed
+          name: OpenWrt‑25.12‑x86‑64‑FullCone‑Complete
           path: openwrt/bin/targets/x86/64/*.img.gz
