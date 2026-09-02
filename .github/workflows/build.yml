@@ -2,13 +2,6 @@ name: Build OpenWrt 25.12 x86_64
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - '.config'
-      - 'scripts/**'
-      - '.github/workflows/build-openwrt.yml'
 
 env:
   OPENWRT_TAG: v25.12.5
@@ -31,7 +24,7 @@ jobs:
           swap-storage: true
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Build Dependencies
         run: |
