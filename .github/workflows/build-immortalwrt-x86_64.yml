@@ -34,26 +34,17 @@ jobs:
           cd immortalwrt
           echo "BUILD_TAG=$(date +%Y%m%d)" >> $GITHUB_ENV
 
-      - name: Add third-party feed (DDNSTO)
+      - name: Clone DDNSTO package (直接克隆到package目录)
         run: |
-          cd immortalwrt
-          # 指定 master 分支拉取 DDNSTO 官方源，避免默认分支异常
-          echo "src-git ddnsto https://github.com/linkease/ddnsto-openwrt-package.git;master" >> feeds.conf.default
+          cd immortalwrt/package
+          git clone --depth 1 https://github.com/linkease/ddnsto-openwrt-package.git ddnsto
 
       - name: Update & install feeds
         run: |
           cd immortalwrt
-          ./scripts/feeds update -a
+          # 失败自动重试一次，应对网络波动
+          ./scripts/feeds update -a || ./scripts/feeds update -a
           ./scripts/feeds install -a
-
-      - name: Feeds package validation
-        run: |
-          cd immortalwrt
-          # 校验关键包是否已被识别，提前发现源加载问题
-          echo "=== 检查 DDNS 相关包 ==="
-          ./scripts/feeds list | grep -E "ddnsto|ddns-go|ddns-scripts" || true
-          echo "=== 检查 Luci 中文包 ==="
-          ./scripts/feeds list | grep -E "zh-cn" | head -20 || true
 
       - name: Generate custom .config
         run: |
@@ -113,7 +104,7 @@ jobs:
       - name: Auto-complete build config
         run: |
           cd immortalwrt
-          # 开启详细日志，报错时直接显示哪个配置项无效
+          # 输出详细日志，方便定位无效配置项
           make defconfig V=s
 
       - name: Download source packages
