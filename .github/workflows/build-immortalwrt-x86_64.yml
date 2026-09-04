@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       source_branch:
-        description: 'ImmortalWrt 源码分支'
+        description: 'ImmortalWrt 源码分支/标签'
         required: true
-        default: 'openwrt-24.10'
+        default: 'v24.10.6'
         type: string
 
 env:
