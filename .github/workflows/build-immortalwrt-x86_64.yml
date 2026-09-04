@@ -6,7 +6,7 @@ on:
       source_branch:
         description: 'ImmortalWrt 源码分支/标签'
         required: true
-        default: 'v24.10.6'
+        default: 'v25.12.1'
         type: string
 
 env:
@@ -105,7 +105,6 @@ jobs:
         run: |
           cd immortalwrt
           unset ARCH CFLAGS CPPFLAGS CXXFLAGS LDFLAGS HOSTCC HOSTCXX
-          # 不手动指定ARCH，让系统自动从.config读取
           make defconfig V=s
 
       - name: Download source packages
