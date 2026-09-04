@@ -33,20 +33,37 @@ jobs:
           cd openwrt
           echo "BUILD_TAG=$(date +%Y%m%d)" >> $GITHUB_ENV
 
-      - name: Clone third-party packages
+      - name: Clone third-party packages (带失败重试)
         run: |
           cd openwrt/package
-          # DDNSTO 官方完整包（含主程序+LuCI+中文）
-          git clone --depth 1 https://github.com/linkease/ddnsto-openwrt-package.git ddnsto
-          # DDNS-Go LuCI 界面（含中文翻译，官方源已带ddns-go二进制）
-          git clone --depth 1 https://github.com/sirpdboy/luci-app-ddns-go.git luci-app-ddns-go
-          # 防火墙 FullCone NAT LuCI 开关插件
-          git clone --depth 1 https://github.com/fullcone-nat/luci-app-firewall-fullcone.git luci-app-firewall-fullcone
+          
+          # 通用克隆重试函数：失败自动重试最多3次，间隔5秒
+          git_clone_retry() {
+            local repo_url=$1
+            local target_dir=$2
+            local retries=3
+            local count=0
+            while [ $count -lt $retries ]; do
+              if git clone --depth 1 --filter=blob:none "$repo_url" "$target_dir"; then
+                echo "✅ $target_dir 克隆成功"
+                return 0
+              fi
+              count=$((count+1))
+              echo "⚠️ $target_dir 克隆失败，第 $count 次重试..."
+              rm -rf "$target_dir"
+              sleep 5
+            done
+            echo "❌ $target_dir 克隆失败，已重试 $retries 次"
+            return 1
+          }
+          
+          git_clone_retry https://github.com/linkease/ddnsto-openwrt-package.git ddnsto
+          git_clone_retry https://github.com/sirpdboy/luci-app-ddns-go.git luci-app-ddns-go
+          git_clone_retry https://github.com/fullcone-nat/luci-app-firewall-fullcone.git luci-app-firewall-fullcone
 
       - name: Update & install feeds
         run: |
           cd openwrt
-          # 彻底清理 CI 环境变量污染
           unset ARCH CFLAGS CPPFLAGS CXXFLAGS LDFLAGS HOSTCC HOSTCXX
           ./scripts/feeds update -a || ./scripts/feeds update -a
           ./scripts/feeds install -a
@@ -108,13 +125,13 @@ jobs:
           CONFIG_PACKAGE_luci-app-ddnsto=y
           CONFIG_PACKAGE_luci-i18n-ddnsto-zh-cn=y
 
-          # ======================== 新增：FullCone NAT 防火墙开关 ========================
+          # ======================== FullCone NAT 防火墙开关 ========================
           CONFIG_PACKAGE_luci-app-firewall-fullcone=y
 
-          # ======================== 新增：Intel 千兆网卡驱动 ========================
+          # ======================== Intel 千兆网卡驱动 ========================
           CONFIG_PACKAGE_kmod-e1000e=y
 
-          # ======================== 新增：系统统计与温度监控 ========================
+          # ======================== 系统统计与温度监控 ========================
           CONFIG_PACKAGE_luci-app-statistics=y
           CONFIG_PACKAGE_collectd-mod-thermal=y
           CONFIG_PACKAGE_kmod-thermal=y
