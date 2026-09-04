@@ -37,14 +37,23 @@ jobs:
       - name: Add third-party feed (DDNSTO)
         run: |
           cd immortalwrt
-          # DDNSTO 官方未收录，添加 LinkEase 官方源
-          echo "src-git ddnsto https://github.com/linkease/ddnsto-openwrt-package.git" >> feeds.conf.default
+          # 指定 master 分支拉取 DDNSTO 官方源，避免默认分支异常
+          echo "src-git ddnsto https://github.com/linkease/ddnsto-openwrt-package.git;master" >> feeds.conf.default
 
       - name: Update & install feeds
         run: |
           cd immortalwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
+      - name: Feeds package validation
+        run: |
+          cd immortalwrt
+          # 校验关键包是否已被识别，提前发现源加载问题
+          echo "=== 检查 DDNS 相关包 ==="
+          ./scripts/feeds list | grep -E "ddnsto|ddns-go|ddns-scripts" || true
+          echo "=== 检查 Luci 中文包 ==="
+          ./scripts/feeds list | grep -E "zh-cn" | head -20 || true
 
       - name: Generate custom .config
         run: |
@@ -104,7 +113,8 @@ jobs:
       - name: Auto-complete build config
         run: |
           cd immortalwrt
-          make defconfig
+          # 开启详细日志，报错时直接显示哪个配置项无效
+          make defconfig V=s
 
       - name: Download source packages
         run: |
@@ -114,7 +124,6 @@ jobs:
       - name: Compile firmware
         run: |
           cd immortalwrt
-          # 多线程编译优先，失败则降级单线程输出详细日志
           make -j$(nproc) || make -j1 V=s
 
       - name: Organize output files
