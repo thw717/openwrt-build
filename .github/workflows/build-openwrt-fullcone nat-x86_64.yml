@@ -153,12 +153,11 @@ jobs:
         echo "==== 克隆 TurboACC 项目 ===="
         git clone --depth 1 -b ${{ env.TURBOACC_BRANCH }} ${{ env.TURBOACC_URL }} turboacc
 
-        echo "==== 执行 TurboACC 安装脚本（不含 SFE） ===="
-        cd turboacc
+        echo "==== 将安装脚本复制到源码根目录执行 ===="
+        cp turboacc/add_turboacc.sh .
         bash add_turboacc.sh --no-sfe
 
         echo "==== 验证集成结果 ===="
-        cd ..
         echo "--- nft-fullcone ---"
         ls package/nft-fullcone/ 2>/dev/null && echo "[OK] nft-fullcone 已就位" || echo "[WARN] nft-fullcone 缺失"
         echo "--- luci-app-turboacc ---"
