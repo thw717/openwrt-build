@@ -1,0 +1,373 @@
+# ============================================================================
+# OpenWrt 官方源码 GitHub Actions 云编译工作流
+# 集成第三方 FullCone NAT (TurboACC) 并提供 LuCI 管理界面开关
+# ============================================================================
+#
+# 【版本选择说明】
+# 默认使用 OpenWrt 24.10.8（turboacc 官方明确支持的版本）
+# 如需切换至 25.12.5，将 REPO_BRANCH 改为 openwrt-25.12 即可
+# 注意：25.12 将包管理器从 opkg 切换为 apk，turboacc 尚未官方适配，
+#       可能需要等待上游更新或手动调整补丁
+#
+# 【FullCone NAT 集成原理】
+# 官方 OpenWrt 使用 firewall4 (nftables)，原生不支持 FullCone NAT。
+# 本工作流通过 chenmozhijin/turboacc 项目实现集成，该方案：
+#   1. 克隆 nft-fullcone 内核模块到 package/ 目录
+#   2. 克隆 luci-app-turboacc 到 package/ 目录（提供 LuCI 管理界面开关）
+#   3. 替换 firewall4、libnftnl、nftables 为支持 FullCone NAT 的补丁版本
+#   4. 在 LuCI "网络→Turbo ACC 网络加速" 界面提供 FullCone NAT 开关
+# 兼容 OpenWrt 22.03 / 23.05 / 24.10，支持内核 5.10 / 5.15 / 6.1 / 6.6 / 6.12
+#
+# 【使用方法】
+# 1. 将此文件放入 GitHub 仓库的 .github/workflows/ 目录下
+# 2. 根据需要修改下方 env: 区域的环境变量
+# 3. 在 GitHub Actions 页面手动触发，或推送代码自动触发
+# 4. 编译完成后在 Actions 页面的 Artifacts 中下载固件
+# ============================================================================
+
+name: Build OpenWrt with FullCone NAT
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: '启用 SSH 调试连接（编译出错时可用于排查）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      clean:
+        description: '是否执行 make clean（首次编译选 true，二次编译选 false）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '.config'
+      - '.github/workflows/**'
+
+# ==================== 全局环境变量 ====================
+env:
+  # OpenWrt 官方源码仓库
+  REPO_URL: https://github.com/openwrt/openwrt.git
+  # 源码分支（24.10.8 对应 openwrt-24.10，25.12.5 对应 openwrt-25.12）
+  REPO_BRANCH: openwrt-24.10
+  # TurboACC 项目地址
+  TURBOACC_URL: https://github.com/chenmozhijin/turboacc.git
+  # TurboACC 分支（luci 分支包含 LuCI 界面，自动适配 OpenWrt 版本）
+  TURBOACC_BRANCH: luci
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    # ========================================================================
+    # 步骤 1：检出当前仓库
+    # ========================================================================
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # ========================================================================
+    # 步骤 2：释放磁盘空间（Runner 默认约 84GB，编译需要较大空间）
+    # ========================================================================
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        df -h
+
+    # ========================================================================
+    # 步骤 3：安装编译依赖
+    # 参考：https://openwrt.org/docs/guide-developer/toolchain/install-buildsystem
+    # ========================================================================
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses5-dev libssl-dev python3 python3-setuptools \
+          rsync swig unzip wget file libelf-dev python3-dev qemu-utils \
+          libtinfo5 aria2 2>&1 | tail -5
+        sudo apt-get autoremove -y --purge
+        sudo apt-get clean
+
+    # ========================================================================
+    # 步骤 4：克隆 OpenWrt 官方源码（浅克隆加速）
+    # ========================================================================
+    - name: Clone OpenWrt source code
+      run: |
+        echo "==== 克隆 OpenWrt 源码 ===="
+        echo "仓库: ${{ env.REPO_URL }}"
+        echo "分支: ${{ env.REPO_BRANCH }}"
+        git clone --depth 1 -b ${{ env.REPO_BRANCH }} ${{ env.REPO_URL }} openwrt
+        cd openwrt
+        echo "源码版本: $(git log -1 --format='%h %s')"
+
+    # ========================================================================
+    # 步骤 5：更新和安装 Feeds
+    # ========================================================================
+    - name: Update and install feeds
+      working-directory: openwrt
+      run: |
+        echo "==== 更新 feeds 源列表 ===="
+        ./scripts/feeds update -a
+        echo "==== 安装 feeds 软件包定义 ===="
+        ./scripts/feeds install -a
+
+    # ========================================================================
+    # 步骤 6：集成 TurboACC FullCone NAT（核心步骤）
+    #
+    # add_turboacc.sh 脚本自动完成以下操作：
+    #   1) 克隆 nft-fullcone → package/nft-fullcone/
+    #      提供 kmod-nft-fullcone 内核模块（FullCone NAT 核心）
+    #   2) 克隆 luci-app-turboacc → package/luci-app-turboacc/
+    #      提供 LuCI Web 管理界面（FullCone NAT 开关）
+    #   3) 替换 firewall4 为补丁版本 → package/firewall4/
+    #      补丁版支持识别和生成 FullCone NAT 的 nftables 规则
+    #   4) 替换 libnftnl 为补丁版本 → package/libs/libnftnl/
+    #      补丁版支持 FullCone NAT 相关的 nftables 表达式
+    #   5) 替换 nftables 为补丁版本 → package/network/utils/nftables/
+    #      补丁版用户态工具支持 FullCone NAT 语法
+    #
+    # 参数：--no-sfe 不集成 Shortcut-FE（避免与某些驱动冲突）
+    #
+    # 编译后在 LuCI 中的位置：
+    #   网络 → Turbo ACC 网络加速 → 勾选"全锥形NAT" → 保存并应用
+    # ========================================================================
+    - name: Integrate FullCone NAT (TurboACC)
+      working-directory: openwrt
+      run: |
+        echo "==== 克隆 TurboACC 项目 ===="
+        git clone --depth 1 -b ${{ env.TURBOACC_BRANCH }} ${{ env.TURBOACC_URL }} turboacc
+
+        echo "==== 执行 TurboACC 安装脚本（不含 SFE） ===="
+        cd turboacc
+        bash add_turboacc.sh --no-sfe
+
+        echo "==== 验证集成结果 ===="
+        cd ..
+        echo "--- nft-fullcone ---"
+        ls package/nft-fullcone/ 2>/dev/null && echo "[OK] nft-fullcone 已就位" || echo "[WARN] nft-fullcone 缺失"
+        echo "--- luci-app-turboacc ---"
+        ls package/luci-app-turboacc/ 2>/dev/null && echo "[OK] luci-app-turboacc 已就位" || echo "[WARN] luci-app-turboacc 缺失"
+        echo "--- 补丁版 firewall4 ---"
+        ls package/firewall4/ 2>/dev/null && echo "[OK] firewall4 已替换" || echo "[WARN] firewall4 缺失"
+        echo "--- 补丁版 libnftnl ---"
+        ls package/libs/libnftnl/ 2>/dev/null && echo "[OK] libnftnl 已替换" || echo "[WARN] libnftnl 缺失"
+        echo "--- 补丁版 nftables ---"
+        ls package/network/utils/nftables/ 2>/dev/null && echo "[OK] nftables 已替换" || echo "[WARN] nftables 缺失"
+
+    # ========================================================================
+    # 步骤 7：生成 .config 编译配置文件
+    #
+    # 如需修改目标架构，修改 CONFIG_TARGET_* 相关行。
+    # 常见架构示例：
+    #   x86_64:   CONFIG_TARGET_x86=y / CONFIG_TARGET_x86_64=y
+    #   R2S/R4S:  CONFIG_TARGET_rockchip=y / CONFIG_TARGET_rockchip_armv8=y
+    #   RAX3000M: CONFIG_TARGET_mediatek=y / CONFIG_TARGET_mediatek_filogic=y
+    # ========================================================================
+    - name: Generate .config
+      working-directory: openwrt
+      run: |
+        cat > .config << 'EOF'
+        # ==================== 目标架构 (x86_64) ====================
+        CONFIG_TARGET_x86=y
+        CONFIG_TARGET_x86_64=y
+        CONFIG_TARGET_x86_64_DEVICE_generic=y
+
+        # ==================== 构建选项 ====================
+        CONFIG_DEVEL=y
+        CONFIG_CCACHE=y
+
+        # ==================== 本地化与镜像 ====================
+        CONFIG_BUILD_NLS=y
+        CONFIG_PACKAGE_luci=y
+        CONFIG_PACKAGE_luci-base=y
+        CONFIG_PACKAGE_luci-mod-admin-full=y
+        CONFIG_PACKAGE_luci-compat=y
+        CONFIG_TARGET_ROOTFS_SQUASHFS=y
+        CONFIG_TARGET_SQUASHFS_BLOCK_SIZE=256
+        CONFIG_TARGET_IMAGES_GZIP=y
+
+        # ==================== 中文语言包 ====================
+        CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
+
+        # ==================== 防火墙 ====================
+        CONFIG_PACKAGE_luci-app-firewall=y
+
+        # ==================== TTYD 终端 ====================
+        CONFIG_PACKAGE_luci-app-ttyd=y
+        CONFIG_PACKAGE_ttyd=y
+
+        # ==================== UPnP 端口映射 ====================
+        CONFIG_PACKAGE_miniupnpd-nftables=y
+        CONFIG_PACKAGE_luci-app-upnp=y
+
+        # ==================== DDNS 动态域名 ====================
+        CONFIG_PACKAGE_ddns-scripts=y
+        CONFIG_PACKAGE_luci-app-ddns=y
+        CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+        CONFIG_PACKAGE_ddns-scripts-dnspod=y
+
+        # ==================== 网络工具 ====================
+        CONFIG_PACKAGE_curl=y
+        CONFIG_PACKAGE_ca-certificates=y
+
+        # ==================== HTTP 服务器 ====================
+        CONFIG_PACKAGE_luci-app-uhttpd=y
+
+        # ==================== 系统统计与传感器 ====================
+        CONFIG_PACKAGE_luci-app-statistics=y
+        CONFIG_PACKAGE_collectd-mod-thermal=y
+        CONFIG_PACKAGE_kmod-thermal=y
+        CONFIG_PACKAGE_kmod-hwmon-core=y
+
+        # ==================== FullCone NAT (TurboACC) ====================
+        CONFIG_PACKAGE_luci-app-turboacc=y
+        CONFIG_PACKAGE_kmod-nft-fullcone=y
+        EOF
+
+        # 清理 heredoc 缩进产生的前导空格
+        sed -i 's/^ *//' .config
+
+        echo "==== 执行 make defconfig 解析依赖 ===="
+        make defconfig
+
+        echo "==== 验证关键配置项 ===="
+        grep -E "CONFIG_PACKAGE_(luci-app-turboacc|kmod-nft-fullcone|luci-i18n-base-zh-cn|miniupnpd-nftables|ddns-scripts-cloudflare|collectd-mod-thermal|luci-app-ttyd)" .config | sort
+
+    # ========================================================================
+    # 步骤 8：自定义 files 覆盖（编译进固件，恢复出厂不丢失）
+    # ========================================================================
+    - name: Apply custom files overlay
+      working-directory: openwrt
+      run: |
+        mkdir -p files/etc/uci-defaults
+
+        cat > files/etc/uci-defaults/99-custom-defaults << 'UCIEOF'
+        #!/bin/sh
+        # 设置时区为 Asia/Shanghai (CST-8)
+        uci set system.@system[0].timezone='CST-8'
+        uci set system.@system[0].zonename='Asia/Shanghai'
+        uci commit system
+
+        # 设置 LuCI 默认语言为简体中文
+        uci set luci.main.lang='zh_cn'
+        uci commit luci
+
+        # 设置 TurboACC 默认启用 FullCone NAT 和 BBR
+        if [ -f /etc/config/turboacc ]; then
+            uci set turboacc.@turboacc[0].fullcone_nat='1'
+            uci set turboacc.@turboacc[0].sw_flow='1'
+            uci set turboacc.@turboacc[0].bbr_cca='1'
+            uci commit turboacc
+        fi
+        UCIEOF
+        chmod +x files/etc/uci-defaults/99-custom-defaults
+
+        echo "==== files 覆盖已应用 ===="
+        find files/ -type f
+
+    # ========================================================================
+    # 步骤 9：（可选）SSH 调试连接
+    # ========================================================================
+    - name: SSH debug connection
+      if: github.event.inputs.ssh == 'true'
+      uses: mxschmitt/action-tmate@v3
+      with:
+        limit-access-to-actor: true
+
+    # ========================================================================
+    # 步骤 10：下载所有软件包源码
+    # ========================================================================
+    - name: Download all package sources
+      working-directory: openwrt
+      run: |
+        make defconfig
+        echo "==== 开始下载软件包源码 ===="
+        make download -j$(nproc) 2>&1 || {
+          echo "[提示] 部分文件下载失败，正在重试..."
+          make download -j1 V=s 2>&1 | tail -50
+        }
+        echo "==== 下载完成 ===="
+        find dl -maxdepth 2 -type f | wc -l
+
+    # ========================================================================
+    # 步骤 11：清理（可选）
+    # ========================================================================
+    - name: Clean build directory
+      if: github.event.inputs.clean == 'true'
+      working-directory: openwrt
+      run: make clean
+
+    # ========================================================================
+    # 步骤 12：编译固件
+    # 首次编译约 2-4 小时，二次编译约 30-60 分钟
+    # ========================================================================
+    - name: Compile OpenWrt firmware
+      working-directory: openwrt
+      run: |
+        THREADS=$(nproc)
+        echo "==== 开始编译 ===="
+        echo "CPU 核心数: $THREADS"
+        echo "OpenWrt 分支: ${{ env.REPO_BRANCH }}"
+        echo "目标架构: x86/64"
+        echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
+
+        make -j$THREADS V=s 2>&1 | tail -30 || {
+          echo "[错误] 编译失败，尝试单线程重编译以定位问题..."
+          make -j1 V=s 2>&1 | tee /tmp/build-error.log | tail -100
+          echo ""
+          echo "==== 编译错误日志（最后 200 行） ===="
+          tail -200 /tmp/build-error.log
+          exit 1
+        }
+
+        echo "==== 编译完成 ===="
+        echo "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+
+    # ========================================================================
+    # 步骤 13：整理和上传编译产物
+    # ========================================================================
+    - name: Organize build artifacts
+      run: |
+        echo "==== 编译产物列表 ===="
+        find openwrt/bin/targets/ -type f \( -name "*.bin" -o -name "*.img*" -o -name "*.manifest" \) | sort
+        echo ""
+        echo "==== 固件 SHA256 校验值 ===="
+        cd openwrt/bin/targets/
+        find . -name "sha256sums" -exec cat {} \;
+
+    - name: Upload firmware
+      uses: actions/upload-artifact@v4
+      with:
+        name: OpenWrt-x86_64-FullConeNAT-${{ github.run_number }}
+        path: openwrt/bin/targets/**
+        retention-days: 7
+
+    - name: Upload build config
+      uses: actions/upload-artifact@v4
+      with:
+        name: Build-Config-${{ github.run_number }}
+        path: |
+          openwrt/.config
+          openwrt/config.buildinfo
+          openwrt/feeds.conf.default
+        retention-days: 7
