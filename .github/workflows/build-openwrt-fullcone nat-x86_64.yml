@@ -1,17 +1,11 @@
 # ============================================================================
 # OpenWrt 25.12 官方源码 GitHub Actions 云编译工作流
-# 集成第三方 FullCone NAT (TurboACC) 并提供 LuCI 管理界面开关
-# 版本：openwrt-25.12 稳定分支 (25.12-SNAPSHOT)
-#
-# 【重要】25.12 已将包管理器从 opkg 切换为 apk (Alpine Package Keeper)
-# 软件包格式从 .ipk 变为 .apk，旧的 .ipk 第三方包无法直接安装
-# 编译系统会自动处理格式转换，.config 写法不变
-# turboacc 在 25.12 上可能存在兼容性问题，如遇编译失败请用 SSH 调试模式排查
-#
-# 【触发方式】仅手动触发（Actions 页面 → Run workflow）
+# 纯净版 FullCone NAT (基于官方 kmod-nft-fullcone)
+# 版本：openwrt-25.12 稳定分支
+# 修改说明：移除了 TurboACC 脚本替换，仅集成原生 FullCone 模块
 # ============================================================================
 
-name: Build OpenWrt 25.12 with FullCone NAT
+name: Build OpenWrt 25.12 Pure FullCone
 
 on:
   workflow_dispatch:
@@ -35,11 +29,7 @@ on:
 
 env:
   REPO_URL: https://github.com/openwrt/openwrt.git
-  # openwrt-25.12 = 25.12 稳定分支（固件标识为 25.12-SNAPSHOT）
-  # 包管理器已切换为 apk，软件包格式为 .apk
   REPO_BRANCH: openwrt-25.12
-  TURBOACC_URL: https://github.com/chenmozhijin/turboacc.git
-  TURBOACC_BRANCH: luci
 
 jobs:
   build:
@@ -51,10 +41,7 @@ jobs:
 
     - name: Free disk space
       run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /usr/local/lib/android
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
         sudo docker image prune --all --force
         df -h
 
@@ -72,14 +59,9 @@ jobs:
     - name: Clone OpenWrt source code
       run: |
         echo "==== 克隆 OpenWrt 源码 ===="
-        echo "仓库: ${{ env.REPO_URL }}"
-        echo "分支/标签: ${{ env.REPO_BRANCH }}"
         git clone --depth 1 -b ${{ env.REPO_BRANCH }} ${{ env.REPO_URL }} openwrt
         cd openwrt
         echo "源码版本: $(git log -1 --format='%h %s')"
-        echo "==== 确认分支版本 ===="
-        grep -r "VERSION_NUMBER" include/version.mk 2>/dev/null || true
-        grep -r "VERSION_CODE" include/version.mk 2>/dev/null || true
 
     - name: Update and install feeds
       working-directory: openwrt
@@ -87,37 +69,7 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: Integrate FullCone NAT (TurboACC)
-      working-directory: openwrt
-      run: |
-        echo "==== 克隆 TurboACC 项目 ===="
-        git clone --depth 1 -b ${{ env.TURBOACC_BRANCH }} ${{ env.TURBOACC_URL }} turboacc
-
-        echo "==== 查看 add_turboacc.sh 脚本内容（前 50 行） ===="
-        head -50 turboacc/add_turboacc.sh
-
-        echo "==== 将安装脚本复制到源码根目录执行 ===="
-        cp turboacc/add_turboacc.sh .
-        bash add_turboacc.sh --no-sfe 2>&1 | tee /tmp/turboacc-install.log
-
-        echo "==== turboacc 安装脚本完整日志 ===="
-        cat /tmp/turboacc-install.log
-
-        echo "==== 验证集成结果 ===="
-        for dir in package/nft-fullcone package/luci-app-turboacc package/firewall4 package/libs/libnftnl package/network/utils/nftables; do
-          if [ -d "$dir" ]; then
-            echo "[OK] $dir"
-            ls -la "$dir/" | head -5
-          else
-            echo "[WARN] $dir 缺失"
-          fi
-        done
-
-        echo "==== 检查 firewall4 Makefile 是否包含 fullcone 补丁标识 ===="
-        grep -i "fullcone\|turboacc\|chenmozhijin" package/firewall4/Makefile 2>/dev/null || echo "[WARN] firewall4 Makefile 中未发现 fullcone 相关标识"
-
-        echo "==== 检查 nftables Makefile 是否包含 fullcone 补丁标识 ===="
-        grep -i "fullcone\|turboacc\|chenmozhijin" package/network/utils/nftables/Makefile 2>/dev/null || echo "[WARN] nftables Makefile 中未发现 fullcone 相关标识"
+    # --- 关键修改点：移除了 TurboACC 脚本集成步骤 ---
 
     - name: Generate .config
       working-directory: openwrt
@@ -158,48 +110,41 @@ jobs:
         CONFIG_PACKAGE_collectd-mod-thermal=y
         CONFIG_PACKAGE_kmod-thermal=y
         CONFIG_PACKAGE_kmod-hwmon-core=y
-        CONFIG_PACKAGE_luci-app-turboacc=y
+        
+        # --- 关键修改点：仅保留 FullCone 核心模块 ---
         CONFIG_PACKAGE_kmod-nft-fullcone=y
+        # 移除了 CONFIG_PACKAGE_luci-app-turboacc=y
         EOF
 
         sed -i 's/^ *//' .config
-
-        echo "==== 执行 make defconfig ===="
         make defconfig
 
-        echo "==== 验证关键配置项 ===="
-        grep -E "CONFIG_(LUCI_LANG_zh_Hans|PACKAGE_luci-i18n-base-zh-cn|PACKAGE_luci-app-turboacc|PACKAGE_kmod-nft-fullcone|PACKAGE_miniupnpd-nftables|PACKAGE_ddns-scripts-cloudflare|PACKAGE_collectd-mod-thermal|PACKAGE_luci-app-ttyd)" .config | sort
-
-        echo "==== 确认包管理器类型 ===="
-        grep -i "apk\|opkg" .config | head -10 || echo "未在 .config 中找到包管理器相关配置"
-
-        echo "==== 检查是否使用 apk ===="
-        if grep -q "CONFIG_USE_APK=y" .config; then
-          echo "[OK] 确认使用 apk 包管理器"
-        else
-          echo "[WARN] 未检测到 CONFIG_USE_APK=y，检查构建系统是否自动启用"
-        fi
-
-    - name: Apply custom files overlay
+    - name: Apply custom files overlay (集成 FullCone 开关到防火墙)
       working-directory: openwrt
       run: |
         mkdir -p files/etc/uci-defaults
 
         cat > files/etc/uci-defaults/99-custom-defaults << 'UCIEOF'
         #!/bin/sh
+        
+        # 设置时区
         uci set system.@system[0].timezone='CST-8'
         uci set system.@system[0].zonename='Asia/Shanghai'
         uci commit system
 
+        # 设置 LuCI 语言
         uci set luci.main.lang='zh_Hans'
         uci commit luci
 
-        if [ -f /etc/config/turboacc ]; then
-            uci set turboacc.@turboacc[0].fullcone_nat='1'
-            uci set turboacc.@turboacc[0].sw_flow='1'
-            uci set turboacc.@turboacc[0].bbr_cca='1'
-            uci commit turboacc
-        fi
+        # --- 关键修改点：将 FullCone 开关集成到防火墙默认配置 ---
+        # 在 OpenWrt 25.12 (Firewall 4) 中，fullcone 是 defaults 的一个选项
+        uci set firewall.@defaults[0].fullcone='1'
+        uci commit firewall
+        
+        # 可选：调整 ARP 缓存阈值以防止溢出
+        echo 'net.ipv4.neigh.default.gc_thresh1=1024' >> /etc/sysctl.conf
+        echo 'net.ipv4.neigh.default.gc_thresh2=2048' >> /etc/sysctl.conf
+        echo 'net.ipv4.neigh.default.gc_thresh3=4096' >> /etc/sysctl.conf
         UCIEOF
         chmod +x files/etc/uci-defaults/99-custom-defaults
 
@@ -232,35 +177,19 @@ jobs:
       run: |
         THREADS=$(nproc)
         echo "==== 开始编译 ===="
-        echo "CPU 核心数: $THREADS"
-        echo "OpenWrt 分支: ${{ env.REPO_BRANCH }}"
         echo "目标架构: x86/64"
-        echo "包管理器: apk (Alpine Package Keeper)"
-        echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
-
-        echo "==== 编译前再次确认版本信息 ===="
-        cat include/version.mk | grep -E "VERSION_NUMBER|VERSION_CODE|VERSION_DIST"
-
+        echo "包管理器: apk"
+        
         make -j$THREADS V=s 2>&1 | tail -30 || {
           echo "[错误] 编译失败，尝试单线程重编译..."
           make -j1 V=s 2>&1 | tee /tmp/build-error.log | tail -100
-          echo "==== 编译错误日志（最后 200 行） ===="
-          tail -200 /tmp/build-error.log
           exit 1
         }
-
-        echo "==== 编译完成 ===="
-        echo "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
 
     - name: Organize build artifacts
       run: |
         echo "==== 编译产物列表 ===="
         find openwrt/bin/targets/ -type f \( -name "*.bin" -o -name "*.img*" -o -name "*.manifest" \) | sort
-        echo ""
-        echo "==== 固件版本信息 ===="
-        cat openwrt/bin/targets/x86/64/version.buildinfo 2>/dev/null || true
-        cat openwrt/bin/targets/x86/64/profiles.json 2>/dev/null | head -20 || true
-        echo ""
         echo "==== 固件 SHA256 校验值 ===="
         cd openwrt/bin/targets/
         find . -name "sha256sums" -exec cat {} \;
@@ -268,7 +197,7 @@ jobs:
     - name: Upload firmware
       uses: actions/upload-artifact@v6
       with:
-        name: OpenWrt-25.12-x86_64-FullConeNAT-${{ github.run_number }}
+        name: OpenWrt-25.12-x86_64-PureFullCone-${{ github.run_number }}
         path: openwrt/bin/targets/**
         retention-days: 7
 
@@ -279,5 +208,4 @@ jobs:
         path: |
           openwrt/.config
           openwrt/config.buildinfo
-          openwrt/feeds.conf.default
         retention-days: 7
