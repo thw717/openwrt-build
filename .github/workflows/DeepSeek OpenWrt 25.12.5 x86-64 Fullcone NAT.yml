@@ -1,4 +1,4 @@
-name: DeepSeek OpenWrt 25.12.5 x86-64 Fullcone NAT
+name: OpenWrt 25.12.5 x86-64 Fullcone NAT
 
 on:
   workflow_dispatch:
@@ -36,68 +36,14 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Integrate nft-fullcone
+      - name: Integrate SONiC Fullcone
         run: |
           set -e
           cd "$GITHUB_WORKSPACE/openwrt"
-
-          if [ -d package/network/utils/nft-fullcone ]; then
-            echo "nft-fullcone already present, skip."
-          else
-            echo "==> 从独立仓库拉取 nft-fullcone ..."
-            rm -rf /tmp/nft-fullcone-src
-            git clone --depth=1 https://github.com/fullcone-nat-nftables/nft-fullcone.git \
-              /tmp/nft-fullcone-src
-
-            mkdir -p package/network/utils/nft-fullcone
-            cp -a /tmp/nft-fullcone-src/. package/network/utils/nft-fullcone/
-          fi
-
-          ls -la package/network/utils/nft-fullcone/
-
-      - name: Patch LuCI firewall
-        run: |
-          set -e
-          cd openwrt
-          TARGET=$(grep -rl "flow_offloading" \
-                     feeds/luci/applications/luci-app-firewall/htdocs/ 2>/dev/null \
-                   | head -n1)
-          if [ -z "$TARGET" ]; then
-            echo "Anchor not found, skip."
-            exit 0
-          fi
-          if grep -q "form.Flag, 'fullcone'" "$TARGET"; then
-            echo "fullcone option already exists, skip."
-            exit 0
-          fi
-
-          cat > /tmp/patch_fullcone.py <<'PYEOF'
-          import sys
-          p = sys.argv[1]
-          with open(p, encoding='utf-8') as f:
-              lines = f.readlines()
-          out = []
-          inserted = False
-          for line in lines:
-              if (not inserted) and ("form.Flag, 'flow_offloading'" in line):
-                  indent = line[:len(line) - len(line.lstrip())]
-                  out.append(indent + "o = s.option(form.Flag, 'fullcone', _('Fullcone NAT'));\n")
-                  out.append(indent + "o.default = '0';\n")
-                  out.append(indent + "o.rmempty = false;\n")
-                  out.append(indent + "o.description = _('Enable Fullcone NAT (requires kmod-nft-fullcone).');\n")
-                  out.append("\n")
-                  inserted = True
-              out.append(line)
-          if not inserted:
-              print("ERROR: flow_offloading anchor not found", file=sys.stderr)
-              sys.exit(1)
-          with open(p, 'w', encoding='utf-8') as f:
-              f.write(''.join(out))
-          print("fullcone option inserted into", p)
-          PYEOF
-
-          sed -i 's/^          //' /tmp/patch_fullcone.py
-          python3 /tmp/patch_fullcone.py "$TARGET"
+          echo "==> 应用 SONiC Fullcone 补丁 ..."
+          curl -sSL https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
+          echo "==> 验证 LuCI 补丁是否生效 ..."
+          grep -rl "fullcone" feeds/luci/applications/luci-app-firewall/htdocs/ || echo "WARN: LuCI 中未找到 fullcone 字样，请检查"
 
       - name: Prepare .config
         run: |
@@ -114,8 +60,6 @@ jobs:
 
           CONFIG_PACKAGE_firewall4=y
           CONFIG_PACKAGE_nftables-json=y
-
-          CONFIG_PACKAGE_kmod-nft-fullcone=y
 
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
@@ -149,7 +93,17 @@ jobs:
 
           sed -i 's/^          //' .config
           make defconfig
-          grep -q "CONFIG_PACKAGE_kmod-nft-fullcone=y" .config
+
+          echo "===== Sanity check ====="
+          for k in luci-app-firewall firewall4 luci-app-upnp ddns-scripts-cloudflare \
+                   luci-app-ttyd luci-app-statistics collectd-mod-thermal; do
+            if grep -q "CONFIG_PACKAGE_${k}=y" .config; then
+              echo "OK   $k"
+            else
+              echo "MISS $k"
+            fi
+          done
+          echo "========================"
 
       - name: Download packages
         run: |
