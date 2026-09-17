@@ -39,28 +39,20 @@ jobs:
       - name: Integrate nft-fullcone
         run: |
           set -e
-          cd openwrt
+          cd "$GITHUB_WORKSPACE/openwrt"
+
           if [ -d package/network/utils/nft-fullcone ]; then
             echo "nft-fullcone already present, skip."
           else
-            rm -rf /tmp/imm
-            git clone --depth=1 --filter=blob:none --sparse \
-              https://github.com/immortalwrt/immortalwrt.git /tmp/imm
-            cd /tmp/imm
-            git sparse-checkout set package/network/utils/nft-fullcone
-            cd "$GITHUB_WORKSPACE/openwrt"
+            echo "==> 从独立仓库拉取 nft-fullcone ..."
+            rm -rf /tmp/nft-fullcone-src
+            git clone --depth=1 https://github.com/fullcone-nat-nftables/nft-fullcone.git \
+              /tmp/nft-fullcone-src
+
             mkdir -p package/network/utils/nft-fullcone
-            cp -a /tmp/imm/package/network/utils/nft-fullcone/. \
-                  package/network/utils/nft-fullcone/
-            for SRC_HACK in /tmp/imm/target/linux/generic/hack-*; do
-              [ -d "$SRC_HACK" ] || continue
-              KVER_DIR=$(basename "$SRC_HACK")
-              if [ -d "target/linux/generic/$KVER_DIR" ]; then
-                cp -n "$SRC_HACK"/952-*.patch "target/linux/generic/$KVER_DIR/" 2>/dev/null || true
-                cp -n "$SRC_HACK"/953-*.patch "target/linux/generic/$KVER_DIR/" 2>/dev/null || true
-              fi
-            done
+            cp -a /tmp/nft-fullcone-src/. package/network/utils/nft-fullcone/
           fi
+
           ls -la package/network/utils/nft-fullcone/
 
       - name: Patch LuCI firewall
