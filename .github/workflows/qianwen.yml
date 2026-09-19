@@ -1,41 +1,50 @@
 name: Build OpenWrt x86_64
 
 on:
-  workflow_dispatch:    # 唯一触发方式：Actions 页面手动点击 Run workflow
+  workflow_dispatch:
 
 env:
-  OPENWRT_REPO:     openwrt/openwrt
-  OPENWRT_VERSION:  v25.12.5
+  # 基础配置
+  OPENWRT_REPO: openwrt/openwrt
+  OPENWRT_VERSION: v25.12.5
+  TARGET_ARCH: x86
+  TARGET_SUB: 64
+  DEVICE_PROFILE: generic
+  
+  # 路径定义
+  SRC_DIR: openwrt-src
+  BIN_DIR: bin/targets/x86/64
+  
+  # 插件脚本
   SONIC_SCRIPT_URL: https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh
-  SRC_DIR:          openwrt-src
-  BIN_DIR:          bin/targets/x86/64
 
 concurrency:
-  group: build-openwrt-x86-64
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: x86_64
+    name: Build x86/64
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
     steps:
-      - name: Free disk space
+      - name: Free Disk Space
         run: |
-          sudo swapoff -a && sudo rm -f /swapfile
+          sudo swapoff -a
+          sudo rm -f /swapfile
           sudo apt clean
           df -h
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           sudo apt update
-          sudo apt install -y build-essential ccache ecj fastjar file g++ \
-            gawk gettext git java-propose-classpath libelf-dev libncurses5-dev \
-            libncursesw5-dev libssl-dev python3 python3-dev python3-distutils \
-            rsync unzip wget zlib1g-dev xsltproc time patch bash
+          sudo apt install -y build-essential ccache ecj fastjar file g++ gawk gettext git \
+            java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev libssl-dev \
+            python3 python3-dev python3-distutils rsync unzip wget zlib1g-dev xsltproc time \
+            patch bash
 
-      - name: Checkout OpenWrt
+      - name: Checkout Source
         uses: actions/checkout@v6
         with:
           repository: ${{ env.OPENWRT_REPO }}
@@ -43,60 +52,73 @@ jobs:
           fetch-depth: 1
           path: ${{ env.SRC_DIR }}
 
-      - name: Update feeds
+      - name: Update Feeds
         working-directory: ${{ env.SRC_DIR }}
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Apply sonic fullcone patches
+      - name: Apply Sonic Fullcone Patch
         working-directory: ${{ env.SRC_DIR }}
         run: |
+          echo "Applying sonic-fullcone patch..."
           curl -sSL ${{ env.SONIC_SCRIPT_URL }} | bash
+
+      # ★★★ 关键步骤：设置默认语言为中文 ★★★
+      - name: Set Default Language to Chinese
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-set-lang <<'EOF'
+#!/bin/sh
+uci set luci.main.lang='zh_cn'
+uci commit luci
+EOF
+          chmod 755 files/etc/uci-defaults/99-set-lang
 
       - name: Write .config
         working-directory: ${{ env.SRC_DIR }}
         run: |
-          cat > .config <<'EOF'
-CONFIG_TARGET_x86=y
-CONFIG_TARGET_x86_64=y
-CONFIG_TARGET_x86_64_DEVICE_generic=y
-CONFIG_DEVEL=y
-CONFIG_CCACHE=y
+          # 使用 printf 避免 heredoc 缩进问题
+          printf '%s\n' \
+            'CONFIG_TARGET_x86=y' \
+            'CONFIG_TARGET_x86_64=y' \
+            'CONFIG_TARGET_x86_64_DEVICE_generic=y' \
+            'CONFIG_DEVEL=y' \
+            'CONFIG_CCACHE=y' \
+            'CONFIG_PACKAGE_luci=y' \
+            'CONFIG_PACKAGE_luci-i18n-base-zh-cn=y' \
+            'CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y' \
+            'CONFIG_PACKAGE_luci-app-ttyd=y' \
+            'CONFIG_PACKAGE_miniupnpd-nftables=y' \
+            'CONFIG_PACKAGE_luci-app-upnp=y' \
+            'CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y' \
+            'CONFIG_PACKAGE_ddns-scripts=y' \
+            'CONFIG_PACKAGE_luci-app-ddns=y' \
+            'CONFIG_PACKAGE_ddns-scripts-cloudflare=y' \
+            'CONFIG_PACKAGE_ddns-scripts-dnspod=y' \
+            'CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y' \
+            'CONFIG_PACKAGE_luci-app-uhttpd=y' \
+            'CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y' \
+            'CONFIG_PACKAGE_luci-app-statistics=y' \
+            'CONFIG_PACKAGE_collectd-mod-thermal=y' \
+            'CONFIG_PACKAGE_kmod-thermal=y' \
+            'CONFIG_PACKAGE_kmod-hwmon-core=y' \
+            'CONFIG_PACKAGE_curl=y' \
+            'CONFIG_PACKAGE_ca-certificates=y' \
+            'CONFIG_PACKAGE_luci-app-sonic-fullcone=y' \
+            > .config
 
-CONFIG_PACKAGE_luci=y
-CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
-
-CONFIG_PACKAGE_luci-app-ttyd=y
-CONFIG_PACKAGE_miniupnpd-nftables=y
-CONFIG_PACKAGE_luci-app-upnp=y
-CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
-
-CONFIG_PACKAGE_ddns-scripts=y
-CONFIG_PACKAGE_luci-app-ddns=y
-CONFIG_PACKAGE_ddns-scripts-cloudflare=y
-CONFIG_PACKAGE_ddns-scripts-dnspod=y
-CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
-
-CONFIG_PACKAGE_luci-app-uhttpd=y
-CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
-
-CONFIG_PACKAGE_luci-app-statistics=y
-CONFIG_PACKAGE_collectd-mod-thermal=y
-CONFIG_PACKAGE_kmod-thermal=y
-CONFIG_PACKAGE_kmod-hwmon-core=y
-
-CONFIG_PACKAGE_curl=y
-CONFIG_PACKAGE_ca-certificates=y
-
-CONFIG_PACKAGE_luci-app-sonic-fullcone=y
-EOF
-
-      - name: Defconfig & download
+      - name: Defconfig & Download
         working-directory: ${{ env.SRC_DIR }}
         run: |
           make defconfig
+          
+          # 校验 1：检查 .config 中语言包符号是否被丢弃
+          echo "Checking config symbols..."
+          grep -q 'CONFIG_PACKAGE_luci-i18n-base-zh-cn=y' .config || {
+            echo "ERROR: Chinese language pack symbol dropped by defconfig!"; exit 1; }
+          
           make download -j$(nproc) || make download -j1 V=s
 
       - name: Cache ccache & dl
@@ -105,18 +127,28 @@ EOF
           path: |
             ~/.ccache
             ${{ env.SRC_DIR }}/dl
-          key: ${{ runner.os }}-owrt-v25.12.5
+          key: ${{ runner.os }}-owrt-${{ env.OPENWRT_VERSION }}
           restore-keys: ${{ runner.os }}-owrt-
 
-      - name: Build
+      - name: Build Firmware
         working-directory: ${{ env.SRC_DIR }}
         run: make -j$(nproc) || make -j1 V=s
 
-      - name: Upload artifacts
+      # ★★★ 校验 2：编译后检查产物中是否包含中文包 ★★★
+      - name: Verify Chinese Packages
+        if: always()
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          echo "Verifying output packages..."
+          find ${{ env.BIN_DIR }}/packages -name '*i18n*zh-cn*' -o -name 'luci-i18n-base-zh-cn*' | head -20 \
+
+            || { echo "ERROR: No Chinese packages found in output!"; exit 1; }
+
+      - name: Upload Artifact
         uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: OpenWrt-x86_64-${{ env.OPENWRT_VERSION }}
+          name: OpenWrt-x86-64-${{ env.OPENWRT_VERSION }}
           path: |
             ${{ env.SRC_DIR }}/${{ env.BIN_DIR }}/*.img.gz
             ${{ env.SRC_DIR }}/${{ env.BIN_DIR }}/*.manifest
