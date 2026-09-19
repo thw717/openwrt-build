@@ -1,0 +1,311 @@
+# ============================================================================
+# OpenWrt 25.12.5 官方正式版 GitHub Actions 云编译工作流
+# 集成 mufeng05/openwrt-sonic-fullcone (内核级 Full Cone NAT 方案)
+# 版本：v25.12.5 官方稳定版
+# ============================================================================
+
+name: Build OpenWrt 25.12.5 with Sonic-Fullcone
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: '启用 SSH 调试连接'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      clean:
+        description: '是否执行 make clean'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  REPO_URL: https://github.com/openwrt/openwrt.git
+  REPO_BRANCH: v25.12.5
+  SONIC_FULLCONE_REPO: https://github.com/mufeng05/openwrt-sonic-fullcone
+  SONIC_FULLCONE_BRANCH: master
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        df -h
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses5-dev libssl-dev python3 python3-setuptools \
+          rsync swig unzip wget file libelf-dev python3-dev qemu-utils \
+          libtinfo5 aria2 \
+          autoconf automake libtool \
+          2>&1 | tail -5
+        sudo apt-get autoremove -y --purge
+        sudo apt-get clean
+
+    - name: Clone OpenWrt source code
+      run: |
+        echo "==== 克隆 OpenWrt 源码 ===="
+        git clone --depth 1 -b ${{ env.REPO_BRANCH }} ${{ env.REPO_URL }} openwrt
+        cd openwrt
+        echo "源码版本: $(git log -1 --format='%h %s')"
+
+    - name: Integrate Sonic Full Cone NAT
+      working-directory: openwrt
+      run: |
+        echo "==== 集成 Sonic Full Cone NAT 补丁 ===="
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+        SCRIPT_URL="${{ env.SONIC_FULLCONE_REPO }}/raw/${{ env.SONIC_FULLCONE_BRANCH }}/add_sonic_fullcone.sh"
+        HTTP_CODE=$(curl -sL -o /tmp/add_sonic_fullcone.sh -w "%{http_code}" "$SCRIPT_URL")
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          SONIC_FULLCONE_BRANCH="main"
+          SCRIPT_URL="${{ env.SONIC_FULLCONE_REPO }}/raw/main/add_sonic_fullcone.sh"
+          HTTP_CODE=$(curl -sL -o /tmp/add_sonic_fullcone.sh -w "%{http_code}" "$SCRIPT_URL")
+          if [ "$HTTP_CODE" != "200" ]; then exit 1; fi
+        fi
+
+        bash /tmp/add_sonic_fullcone.sh 2>&1 | tee /tmp/sonic-install.log
+
+    - name: Generate .config
+      working-directory: openwrt
+      run: |
+        cat > .config << 'EOF'
+        CONFIG_TARGET_x86=y
+        CONFIG_TARGET_x86_64=y
+        CONFIG_TARGET_x86_64_DEVICE_generic=y
+        CONFIG_DEVEL=y
+        CONFIG_CCACHE=y
+        CONFIG_BUILD_NLS=y
+        CONFIG_LUCI_LANG_zh_Hans=y
+        CONFIG_PACKAGE_luci=y
+        CONFIG_PACKAGE_luci-base=y
+        CONFIG_PACKAGE_luci-mod-admin-full=y
+        CONFIG_PACKAGE_luci-compat=y
+        CONFIG_TARGET_ROOTFS_SQUASHFS=y
+        CONFIG_TARGET_SQUASHFS_BLOCK_SIZE=256
+        CONFIG_TARGET_IMAGES_GZIP=y
+        CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
+        CONFIG_PACKAGE_luci-app-firewall=y
+        CONFIG_PACKAGE_luci-app-ttyd=y
+        CONFIG_PACKAGE_ttyd=y
+        CONFIG_PACKAGE_miniupnpd-nftables=y
+        CONFIG_PACKAGE_luci-app-upnp=y
+        CONFIG_PACKAGE_ddns-scripts=y
+        CONFIG_PACKAGE_luci-app-ddns=y
+        CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+        CONFIG_PACKAGE_ddns-scripts-dnspod=y
+        CONFIG_PACKAGE_curl=y
+        CONFIG_PACKAGE_ca-certificates=y
+        CONFIG_PACKAGE_luci-app-uhttpd=y
+        CONFIG_PACKAGE_luci-app-statistics=y
+        CONFIG_PACKAGE_collectd-mod-thermal=y
+        CONFIG_PACKAGE_kmod-thermal=y
+        CONFIG_PACKAGE_kmod-hwmon-core=y
+        CONFIG_PACKAGE_kmod-nft-fullcone=y
+        CONFIG_PACKAGE_lm-sensors=y
+        CONFIG_PACKAGE_kmod-hwmon-vid=y
+        CONFIG_PACKAGE_kmod-hwmon-coretemp=y
+        CONFIG_PACKAGE_kmod-i2c-core=y
+        CONFIG_PACKAGE_kmod-i2c-i801=y
+        CONFIG_PACKAGE_kmod-i2c-smbus=y
+        CONFIG_PACKAGE_kmod-acpi-cpufreq=y
+        CONFIG_PACKAGE_kmod-nft-offload=y
+        CONFIG_PACKAGE_kmod-nf-flow=y
+        EOF
+        sed -i 's/^ *//' .config
+        make defconfig
+
+    - name: Apply custom files overlay
+      working-directory: openwrt
+      run: |
+        mkdir -p files/usr/bin
+        mkdir -p files/www/cgi-bin
+        mkdir -p files/usr/lib/lua/luci/view/admin_status
+        mkdir -p files/etc/uci-defaults
+
+        # ===== 1. CPU 占用脚本（0.2s 双采样） =====
+        cat > files/usr/bin/get_cpu << 'CPUEOF'
+        #!/bin/sh
+        set -- $(cat /proc/stat | head -1)
+        u1=$3; n1=$4; s1=$5; i1=$6; w1=$7; q1=$8; k1=$9
+        shift 9; r1=$1
+        t1=$((u1+n1+s1+i1+w1+q1+k1+r1))
+        sleep 0.2
+        set -- $(cat /proc/stat | head -1)
+        u2=$3; n2=$4; s2=$5; i2=$6; w2=$7; q2=$8; k2=$9
+        shift 9; r2=$1
+        t2=$((u2+n2+s2+i2+w2+q2+k2+r2))
+        dt=$((t2-t1)); di=$((i2-i1))
+        if [ "$dt" -gt 0 ]; then
+          echo $(( (dt-di)*100/dt ))
+        else
+          echo 0
+        fi
+        CPUEOF
+        chmod +x files/usr/bin/get_cpu
+
+        # ===== 2. 温度脚本（只取 acpitz 和 Package id 0） =====
+        cat > files/usr/bin/get_temp << 'TEMPEOF'
+        #!/bin/sh
+        result=""
+        for z in /sys/class/thermal/thermal_zone*; do
+            t=$(cat "$z/type" 2>/dev/null)
+            case "$t" in
+                acpitz|Package\ id\ 0)
+                    raw=$(cat "$z/temp" 2>/dev/null)
+                    [ -n "$raw" ] && result="${result}${t}: $((raw/1000))°C  "
+                    ;;
+            esac
+        done
+        [ -n "$result" ] && echo "$result" || echo "N/A"
+        TEMPEOF
+        chmod +x files/usr/bin/get_temp
+
+        # ===== 3. CGI 端点（一次返回 CPU|温度） =====
+        cat > files/www/cgi-bin/sysinfo << 'CGIEOF'
+        #!/bin/sh
+        echo "Content-Type: text/plain"
+        echo ""
+        printf "%s|%s" "$(/usr/bin/get_cpu)" "$(/usr/bin/get_temp)"
+        CGIEOF
+        chmod +x files/www/cgi-bin/sysinfo
+
+        # ===== 4. 首页状态行（CPU + 温度，统一 1 秒刷新） =====
+        cat > files/usr/lib/lua/luci/view/admin_status/sysinfo_row.htm << 'ROWEOF'
+        <tr>
+            <td width="33%"><%:CPU Usage%></td>
+            <td id="_cpu_val"><%=luci.util.exec("/usr/bin/get_cpu")%>%</td>
+        </tr>
+        <tr>
+            <td width="33%"><%:Temperature%></td>
+            <td id="_temp_val"><%=luci.util.exec("/usr/bin/get_temp")%></td>
+        </tr>
+        <script>
+        (function() {
+            var cpuEl = document.getElementById('_cpu_val');
+            var tmpEl = document.getElementById('_temp_val');
+            if (!cpuEl && !tmpEl) return;
+            var busy = false;
+            setInterval(function() {
+                if (document.hidden || busy) return;
+                busy = true;
+                var xhr = new XMLHttpRequest();
+                xhr.open('GET', '/cgi-bin/sysinfo', true);
+                xhr.timeout = 2000;
+                xhr.onload = function() {
+                    busy = false;
+                    if (xhr.status === 200) {
+                        var p = xhr.responseText.trim().split('|');
+                        if (p[0] !== undefined) cpuEl.textContent = p[0] + '%';
+                        if (p[1] !== undefined) tmpEl.textContent = p[1];
+                    }
+                };
+                xhr.onerror = xhr.ontimeout = function() { busy = false; };
+                xhr.send();
+            }, 1000);   // CPU 和温度统一 1 秒刷新
+        })();
+        </script>
+        ROWEOF
+
+        # ===== 5. uci-defaults：Fullcone + 插入首页 =====
+        cat > files/etc/uci-defaults/99-custom-defaults << 'UCIEOF'
+        #!/bin/sh
+
+        uci set system.@system[0].timezone='CST-8'
+        uci set system.@system[0].zonename='Asia/Shanghai'
+        uci commit system
+        uci set luci.main.lang='zh_Hans'
+        uci commit luci
+
+        uci set firewall.@defaults[0].fullcone='1'
+
+        for z in $(uci show firewall | grep -E '\.name=' | sed -n "s/firewall.\([^=]*\)\.name='\([^']*\)'/\1 \2/p"); do
+          sec=$(echo "$z" | awk '{print $1}')
+          nam=$(echo "$z" | awk '{print $2}')
+          [ -z "$sec" ] && continue
+          uci set firewall.${sec}.fullcone='1'
+          uci set firewall.${sec}.fullcone_proto='tcp udp udplite'
+        done
+        uci -q get firewall.wan.name >/dev/null 2>&1 && {
+          uci set firewall.wan.fullcone='1'; uci set firewall.wan.fullcone_proto='tcp udp udplite'
+        }
+        uci -q get firewall.wan6.name >/dev/null 2>&1 && {
+          uci set firewall.wan6.fullcone='1'; uci set firewall.wan6.fullcone_proto='tcp udp udplite'
+        }
+        uci commit firewall
+
+        INDEX="/usr/lib/lua/luci/view/admin_status/index.htm"
+        if [ -f "$INDEX" ] && ! grep -q "sysinfo_row" "$INDEX"; then
+            sed -i '/<%:Localtime%>/,/<\/tr>/{
+                /<\/tr>/a\
+<%- include("admin_status/sysinfo_row") %>
+            }' "$INDEX"
+        fi
+        UCIEOF
+        chmod +x files/etc/uci-defaults/99-custom-defaults
+
+        echo "==== files 覆盖已应用 ===="
+        find files/ -type f
+
+    - name: SSH debug connection
+      if: github.event.inputs.ssh == 'true'
+      uses: mxschmitt/action-tmate@v3
+      with:
+        limit-access-to-actor: true
+
+    - name: Download all package sources
+      working-directory: openwrt
+      run: make defconfig && make download -j$(nproc) 2>&1 || make download -j1 V=s
+
+    - name: Clean build directory
+      if: github.event.inputs.clean == 'true'
+      working-directory: openwrt
+      run: make clean
+
+    - name: Compile OpenWrt firmware
+      working-directory: openwrt
+      run: |
+        make -j$(nproc) V=s 2>&1 | tail -30 || { make -j1 V=s 2>&1 | tail -100; exit 1; }
+
+    - name: Upload firmware
+      uses: actions/upload-artifact@v6
+      with:
+        name: OpenWrt-25.12.5-x86_64-sonic-fullcone-${{ github.run_number }}
+        path: openwrt/bin/targets/**
+        retention-days: 7
+
+    - name: Upload build config
+      uses: actions/upload-artifact@v6
+      with:
+        name: Build-Config-${{ github.run_number }}
+        path: |
+          openwrt/.config
+          openwrt/config.buildinfo
+          openwrt/feeds.conf.default
+        retention-days: 7
