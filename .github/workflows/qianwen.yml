@@ -1,53 +1,41 @@
 name: Build OpenWrt x86_64
 
-# 仅允许手动触发
 on:
-  workflow_dispatch:
+  workflow_dispatch:    # 唯一触发方式：Actions 页面手动点击 Run workflow
 
 env:
-  # 核心配置
-  OPENWRT_REPO: openwrt/openwrt
-  OPENWRT_VERSION: v25.12.5
-  TARGET_PLATFORM: x86
-  TARGET_SUBTARGET: 64
-  DEVICE_PROFILE: generic
-
-  # 插件与脚本
+  OPENWRT_REPO:     openwrt/openwrt
+  OPENWRT_VERSION:  v25.12.5
   SONIC_SCRIPT_URL: https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh
-
-  # 路径定义
-  SRC_DIR: openwrt-src
-  BIN_DIR: bin/targets/x86/64
+  SRC_DIR:          openwrt-src
+  BIN_DIR:          bin/targets/x86/64
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: build-openwrt-x86-64
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build for x86_64
+    name: x86_64
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
     steps:
-      # 1. 准备工作：释放磁盘空间
-      - name: Free up disk space
+      - name: Free disk space
         run: |
-          sudo swapoff -a
-          sudo rm -f /swapfile
+          sudo swapoff -a && sudo rm -f /swapfile
           sudo apt clean
           df -h
 
-      # 2. 安装编译依赖
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y build-essential ccache ecj fastjar file g++ gawk gettext git \
-            java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev libssl-dev \
-            python3 python3-dev python3-distutils rsync unzip wget zlib1g-dev xsltproc time patch bash
+          sudo apt install -y build-essential ccache ecj fastjar file g++ \
+            gawk gettext git java-propose-classpath libelf-dev libncurses5-dev \
+            libncursesw5-dev libssl-dev python3 python3-dev python3-distutils \
+            rsync unzip wget zlib1g-dev xsltproc time patch bash
 
-      # 3. 检出 OpenWrt 官方源码
-      - name: Checkout OpenWrt Source Code
+      - name: Checkout OpenWrt
         uses: actions/checkout@v6
         with:
           repository: ${{ env.OPENWRT_REPO }}
@@ -55,96 +43,76 @@ jobs:
           fetch-depth: 1
           path: ${{ env.SRC_DIR }}
 
-      # 4. 更新并安装 Feeds
-      - name: Update and Install Feeds
+      - name: Update feeds
         working-directory: ${{ env.SRC_DIR }}
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # 5. 应用 openwrt-sonic-fullcone 补丁
-      - name: Apply Sonic Fullcone Patches
+      - name: Apply sonic fullcone patches
         working-directory: ${{ env.SRC_DIR }}
         run: |
-          echo "Applying patches from mufeng05/openwrt-sonic-fullcone..."
           curl -sSL ${{ env.SONIC_SCRIPT_URL }} | bash
 
-      # 6. 写入自定义 .config 配置文件
-      - name: Write Custom .config
+      - name: Write .config
         working-directory: ${{ env.SRC_DIR }}
         run: |
-          cat > .config << EOF
-CONFIG_TARGET_${{ env.TARGET_PLATFORM }}=y
-CONFIG_TARGET_${{ env.TARGET_PLATFORM }}_${{ env.TARGET_SUBTARGET }}=y
-CONFIG_TARGET_${{ env.TARGET_PLATFORM }}_${{ env.TARGET_SUBTARGET }}_DEVICE_${{ env.DEVICE_PROFILE }}=y
-
+          cat > .config <<'EOF'
+CONFIG_TARGET_x86=y
+CONFIG_TARGET_x86_64=y
+CONFIG_TARGET_x86_64_DEVICE_generic=y
 CONFIG_DEVEL=y
 CONFIG_CCACHE=y
 
-# --- LuCI 基础与语言包 ---
 CONFIG_PACKAGE_luci=y
 CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
 CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
 
-# --- 网络工具与服务 ---
 CONFIG_PACKAGE_luci-app-ttyd=y
 CONFIG_PACKAGE_miniupnpd-nftables=y
 CONFIG_PACKAGE_luci-app-upnp=y
 CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
 
-# --- DDNS 服务 ---
 CONFIG_PACKAGE_ddns-scripts=y
 CONFIG_PACKAGE_luci-app-ddns=y
 CONFIG_PACKAGE_ddns-scripts-cloudflare=y
 CONFIG_PACKAGE_ddns-scripts-dnspod=y
 CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
 
-# --- Web 服务器 ---
 CONFIG_PACKAGE_luci-app-uhttpd=y
 CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
 
-# --- 系统监控 ---
 CONFIG_PACKAGE_luci-app-statistics=y
 CONFIG_PACKAGE_collectd-mod-thermal=y
 CONFIG_PACKAGE_kmod-thermal=y
 CONFIG_PACKAGE_kmod-hwmon-core=y
 
-# --- 其他工具 ---
 CONFIG_PACKAGE_curl=y
 CONFIG_PACKAGE_ca-certificates=y
 
-# --- Fullcone NAT (由补丁注入) ---
 CONFIG_PACKAGE_luci-app-sonic-fullcone=y
 EOF
-          echo "Custom .config written successfully."
 
-      # 7. 生成默认配置并下载源码
-      - name: Defconfig and Download Sources
+      - name: Defconfig & download
         working-directory: ${{ env.SRC_DIR }}
         run: |
           make defconfig
-          make download -j$(nproc)
+          make download -j$(nproc) || make download -j1 V=s
 
-      # 8. 缓存配置 (ccache 和 dl 目录)
-      - name: Cache ccache and dl directory
+      - name: Cache ccache & dl
         uses: actions/cache@v6
         with:
           path: |
             ~/.ccache
             ${{ env.SRC_DIR }}/dl
-          key: ${{ runner.os }}-openwrt-${{ env.OPENWRT_VERSION }}-${{ hashFiles(format('{0}/.config', env.SRC_DIR)) }}
-          restore-keys: |
-            ${{ runner.os }}-openwrt-${{ env.OPENWRT_VERSION }}-
+          key: ${{ runner.os }}-owrt-v25.12.5
+          restore-keys: ${{ runner.os }}-owrt-
 
-      # 9. 开始编译
-      - name: Compile Firmware
+      - name: Build
         working-directory: ${{ env.SRC_DIR }}
-        run: |
-          echo "Starting compilation..."
-          make -j$(nproc) || make -j1 V=s
+        run: make -j$(nproc) || make -j1 V=s
 
-      # 10. 上传编译产物
-      - name: Upload Artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -155,3 +123,4 @@ EOF
             ${{ env.SRC_DIR }}/${{ env.BIN_DIR }}/profiles.json
             ${{ env.SRC_DIR }}/${{ env.BIN_DIR }}/packages/
           retention-days: 7
+          if-no-files-found: warn
