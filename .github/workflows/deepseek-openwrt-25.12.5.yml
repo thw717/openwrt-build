@@ -1,0 +1,213 @@
+name: Build OpenWrt 25.12.5 with Sonic-Fullcone
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: '启用 SSH 调试连接'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      clean:
+        description: '是否执行 make clean'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  REPO_URL: https://github.com/openwrt/openwrt.git
+  REPO_BRANCH: v25.12.5
+  SONIC_FULLCONE_REPO: https://github.com/mufeng05/openwrt-sonic-fullcone
+  SONIC_FULLCONE_BRANCH: master
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force 2>/dev/null || true
+        df -h
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses5-dev libssl-dev python3 python3-setuptools \
+          rsync swig unzip wget file libelf-dev python3-dev qemu-utils \
+          libtinfo5 aria2 \
+          autoconf automake libtool
+        sudo apt-get autoremove -y --purge
+        sudo apt-get clean
+
+    - name: Clone OpenWrt source code
+      run: |
+        echo "==== 克隆 OpenWrt 源码 ===="
+        git clone --depth 1 -b ${{ env.REPO_BRANCH }} ${{ env.REPO_URL }} openwrt
+        cd openwrt
+        echo "源码版本: $(git log -1 --format='%h %s')"
+
+    - name: Integrate Sonic Full Cone NAT
+      working-directory: openwrt
+      run: |
+        set -eo pipefail
+        echo "==== 集成 Sonic Full Cone NAT 补丁 ===="
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+        SCRIPT_URL="${{ env.SONIC_FULLCONE_REPO }}/raw/${{ env.SONIC_FULLCONE_BRANCH }}/add_sonic_fullcone.sh"
+        HTTP_CODE=$(curl -sL -o /tmp/add_sonic_fullcone.sh -w "%{http_code}" "$SCRIPT_URL")
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "master 分支取不到，回退 main"
+          SCRIPT_URL="${{ env.SONIC_FULLCONE_REPO }}/raw/main/add_sonic_fullcone.sh"
+          HTTP_CODE=$(curl -sL -o /tmp/add_sonic_fullcone.sh -w "%{http_code}" "$SCRIPT_URL")
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "!! Sonic 补丁脚本下载失败 (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+        fi
+
+        echo "---- Sonic 补丁脚本开始执行 ----"
+        bash /tmp/add_sonic_fullcone.sh 2>&1 | tee /tmp/sonic-install.log
+        echo "---- Sonic 补丁脚本执行完毕 ----"
+
+    - name: Generate .config
+      working-directory: openwrt
+      run: |
+        set -e
+        cat > .config << 'EOF'
+        CONFIG_TARGET_x86=y
+        CONFIG_TARGET_x86_64=y
+        CONFIG_TARGET_x86_64_DEVICE_generic=y
+        CONFIG_DEVEL=y
+        CONFIG_CCACHE=y
+        CONFIG_BUILD_NLS=y
+        CONFIG_LUCI_LANG_zh_Hans=y
+        CONFIG_PACKAGE_luci=y
+        CONFIG_PACKAGE_luci-base=y
+        CONFIG_PACKAGE_luci-mod-admin-full=y
+        CONFIG_PACKAGE_luci-compat=y
+        CONFIG_TARGET_ROOTFS_SQUASHFS=y
+        CONFIG_TARGET_SQUASHFS_BLOCK_SIZE=256
+        CONFIG_TARGET_IMAGES_GZIP=y
+        CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
+        CONFIG_PACKAGE_luci-app-firewall=y
+        CONFIG_PACKAGE_luci-app-ttyd=y
+        CONFIG_PACKAGE_ttyd=y
+        CONFIG_PACKAGE_miniupnpd-nftables=y
+        CONFIG_PACKAGE_luci-app-upnp=y
+        CONFIG_PACKAGE_ddns-scripts=y
+        CONFIG_PACKAGE_luci-app-ddns=y
+        CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+        CONFIG_PACKAGE_ddns-scripts-dnspod=y
+        CONFIG_PACKAGE_curl=y
+        CONFIG_PACKAGE_ca-certificates=y
+        CONFIG_PACKAGE_luci-app-uhttpd=y
+        CONFIG_PACKAGE_kmod-nft-offload=y
+        CONFIG_PACKAGE_kmod-nf-flow=y
+        EOF
+        make defconfig
+
+    - name: Apply uci-defaults overlay
+      working-directory: openwrt
+      run: |
+        set -e
+        mkdir -p files/etc/uci-defaults
+
+        cat > files/etc/uci-defaults/99-custom-defaults << 'UCIEOF'
+        #!/bin/sh
+
+        uci set system.@system[0].timezone='CST-8'
+        uci set system.@system[0].zonename='Asia/Shanghai'
+        uci commit system
+
+        uci set luci.main.lang='zh_Hans'
+        uci commit luci
+
+        uci set firewall.@defaults[0].fullcone='1'
+
+        for z in $(uci show firewall | grep -E '\.name=' | sed -n "s/firewall.\([^=]*\)\.name='\([^']*\)'/\1 \2/p"); do
+          sec=$(echo "$z" | awk '{print $1}')
+          [ -z "$sec" ] && continue
+          uci set firewall.${sec}.fullcone='1'
+          uci set firewall.${sec}.fullcone_proto='tcp udp udplite'
+        done
+
+        if uci -q get firewall.wan.name >/dev/null 2>&1; then
+          uci set firewall.wan.fullcone='1'
+          uci set firewall.wan.fullcone_proto='tcp udp udplite'
+        fi
+
+        if uci -q get firewall.wan6.name >/dev/null 2>&1; then
+          uci set firewall.wan6.fullcone='1'
+          uci set firewall.wan6.fullcone_proto='tcp udp udplite'
+        fi
+
+        uci commit firewall
+        UCIEOF
+
+        chmod +x files/etc/uci-defaults/99-custom-defaults
+
+        echo "==== overlay 文件清单 ===="
+        find files/ -type f
+
+    - name: SSH debug connection
+      if: github.event.inputs.ssh == 'true'
+      uses: mxschmitt/action-tmate@v3
+      with:
+        limit-access-to-actor: true
+
+    - name: Download all package sources
+      working-directory: openwrt
+      run: |
+        set -eo pipefail
+        make defconfig
+        make download -j$(nproc) || make download -j1 V=s
+
+    - name: Clean build directory
+      if: github.event.inputs.clean == 'true'
+      working-directory: openwrt
+      run: make clean
+
+    - name: Compile OpenWrt firmware
+      working-directory: openwrt
+      run: |
+        set -o pipefail
+        make -j$(nproc) V=s 2>&1 | tail -30 || make -j1 V=s 2>&1 | tail -100
+
+    - name: Upload firmware
+      uses: actions/upload-artifact@v6
+      with:
+        name: OpenWrt-25.12.5-x86_64-sonic-fullcone-${{ github.run_number }}
+        path: openwrt/bin/targets/**
+        retention-days: 7
+
+    - name: Upload build config
+      uses: actions/upload-artifact@v6
+      with:
+        name: Build-Config-${{ github.run_number }}
+        path: |
+          openwrt/.config
+          openwrt/config.buildinfo
+          openwrt/feeds.conf.default
+        retention-days: 7
