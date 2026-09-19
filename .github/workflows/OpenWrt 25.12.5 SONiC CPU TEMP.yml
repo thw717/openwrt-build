@@ -1,9 +1,3 @@
-# ============================================================================
-# OpenWrt 25.12.5 官方正式版 GitHub Actions 云编译工作流
-# 集成 mufeng05/openwrt-sonic-fullcone (内核级 Full Cone NAT 方案)
-# 版本：v25.12.5 官方稳定版
-# ============================================================================
-
 name: Build OpenWrt 25.12.5 with Sonic-Fullcone
 
 on:
@@ -192,7 +186,7 @@ jobs:
         #!/bin/sh
         echo "Content-Type: text/plain"
         echo ""
-        printf "%s|%s" "$(/usr/bin/get_cpu)" "$(/usr/bin/get_temp)"
+        printf "%s|%s" "$( /usr/bin/get_cpu )" "$( /usr/bin/get_temp )"
         CGIEOF
         chmod +x files/www/cgi-bin/sysinfo
 
@@ -228,7 +222,7 @@ jobs:
                 };
                 xhr.onerror = xhr.ontimeout = function() { busy = false; };
                 xhr.send();
-            }, 1000);   // CPU 和温度统一 1 秒刷新
+            }, 1000);
         })();
         </script>
         ROWEOF
@@ -262,10 +256,8 @@ jobs:
 
         INDEX="/usr/lib/lua/luci/view/admin_status/index.htm"
         if [ -f "$INDEX" ] && ! grep -q "sysinfo_row" "$INDEX"; then
-            sed -i '/<%:Localtime%>/,/<\/tr>/{
-                /<\/tr>/a\
-<%- include("admin_status/sysinfo_row") %>
-            }' "$INDEX"
+          awk '/<%:Localtime%>/{p=1} p&&/<\/tr>/{print "<%- include(\"admin_status/sysinfo_row\") %>";p=0}1' \
+              "$INDEX" > "$INDEX.tmp" && mv "$INDEX.tmp" "$INDEX"
         fi
         UCIEOF
         chmod +x files/etc/uci-defaults/99-custom-defaults
