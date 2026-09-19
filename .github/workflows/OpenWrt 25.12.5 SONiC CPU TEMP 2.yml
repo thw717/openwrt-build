@@ -12,17 +12,15 @@ on:
 env:
   REPO_URL: https://github.com/openwrt/openwrt
   REPO_BRANCH: v25.12.5
-  CONFIG_FILE: .config
   SONIC_FULLCONE_REPO: https://github.com/mufeng05/sonic-fullcone
   SONIC_FULLCONE_BRANCH: ${{ github.event.inputs.SONIC_FULLCONE_BRANCH || 'main' }}
-  MAKE_JOBS: -j$(nproc)
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout your repo (for overlay / patches)
+      - name: Checkout your repo
         uses: actions/checkout@v4
 
       - name: Prepare build environment
@@ -42,9 +40,9 @@ jobs:
       - name: Apply sonic-fullcone kernel patch
         run: |
           cd openwrt
-          git clone --depth 1 --branch ${{ env.SONIC_FULLCONE_BRANCH }} \
-            ${{ env.SONIC_FULLCONE_REPO }} sonic-fullcone || \
-          git clone --depth 1 --branch main ${{ env.SONIC_FULLCONE_REPO }} sonic-fullcone
+          git clone --depth 1 --branch ${{ env.SONIC_FULLCONE_BRANCH }} ${{ env.SONIC_FULLCONE_REPO }} sonic-fullcone \
+
+            || git clone --depth 1 --branch main ${{ env.SONIC_FULLCONE_REPO }} sonic-fullcone
           cd sonic-fullcone
           ./install.sh ../
 
@@ -57,22 +55,18 @@ jobs:
         run: |
           cd openwrt
           cat > .config << 'CFGEOF'
-CONFIG_TARGET_x86_64=y
-CONFIG_TARGET_x86_64_generic=y
-CONFIG_TARGET_ROOTFS_SQUASHFS=y
-CONFIG_TARGET_IMAGES_GZIP=y
-CONFIG_DEVEL=y
-CONFIG_CCACHE=y
-CONFIG_PACKAGE_luci-app-firewall=y
-CONFIG_PACKAGE_luci-app-opkg=y
-# fullcone
-CONFIG_PACKAGE_kmod-nft-fullcone=y
-CFGEOF
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_generic=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          CONFIG_TARGET_IMAGES_GZIP=y
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_luci-app-opkg=y
+          CONFIG_PACKAGE_kmod-nft-fullcone=y
+          CFGEOF
           make defconfig
 
-      # ============================================================
-      #  自定义文件覆盖：CPU / 温度 / CGI / 首页行 / uci-defaults
-      # ============================================================
       - name: Generate custom files overlay
         run: |
           set -e
@@ -81,7 +75,6 @@ CFGEOF
           mkdir -p files/usr/lib/lua/luci/view/admin_status
           mkdir -p files/etc/uci-defaults
 
-          # ---------- /usr/bin/get_cpu ----------
           cat > files/usr/bin/get_cpu << 'EOF'
           #!/bin/sh
           read u1 n1 s1 i1 _ < /proc/stat
@@ -93,23 +86,16 @@ CFGEOF
           EOF
           chmod +x files/usr/bin/get_cpu
 
-          # ---------- /usr/bin/get_temp (thermal_zone + hwmon 双路枚举) ----------
           cat > files/usr/bin/get_temp << 'EOF'
           #!/bin/sh
-          out=""
-          sep=""
+          out=""; sep=""
           add() { [ -n "$1" ] && out="${out}${sep}$1" && sep=" | "; }
-
           for z in /sys/class/thermal/thermal_zone*; do
             [ -e "$z" ] || continue
-            t=$(cat "$z/type" 2>/dev/null)
-            v=$(cat "$z/temp" 2>/dev/null)
-            case "$t" in
-              acpitz|Package\ id\ 0|x86_pkg_temp*|Core\ *|CPU|pch_*)
-                [ -n "$v" ] && add "${t}: $((v/1000))°C" ;;
-            esac
+            t=$(cat "$z/type" 2>/dev/null); v=$(cat "$z/temp" 2>/dev/null)
+            case "$t" in acpitz|Package\ id\ 0|x86_pkg_temp*|Core\ *|CPU|pch_*)
+              [ -n "$v" ] && add "${t}: $((v/1000))C" ;; esac
           done
-
           for d in /sys/class/hwmon/hwmon*; do
             [ -e "$d" ] || continue
             name=$(cat "$d/name" 2>/dev/null)
@@ -121,15 +107,13 @@ CFGEOF
               if [ -n "$l" ]; then tag="$l"
               elif [ -n "$name" ]; then tag="${name}$(basename "$f"|tr -dc '0-9')"
               else tag="temp$(basename "$f"|tr -dc '0-9')"; fi
-              add "${tag}: ${v}°C"
+              add "${tag}: ${v}C"
             done
           done
-
           [ -n "$out" ] && echo "$out" || echo "N/A"
           EOF
           chmod +x files/usr/bin/get_temp
 
-          # ---------- /www/cgi-bin/sysinfo ----------
           cat > files/www/cgi-bin/sysinfo << 'EOF'
           #!/bin/sh
           printf 'Content-Type: text/plain\r\n\r\n'
@@ -139,23 +123,19 @@ CFGEOF
           EOF
           chmod +x files/www/cgi-bin/sysinfo
 
-          # ---------- 首页状态行（独立 view，被 uci-defaults 注入引用） ----------
           cat > files/usr/lib/lua/luci/view/admin_status/sysinfo_row.htm << 'EOF'
           <tr><td width="33%"><%:CPU Usage%></td><td id="_cpu_val">-</td></tr>
           <tr><td width="33%"><%:Temperature%></td><td id="_temp_val">-</td></tr>
           <script>(function(){var b=false,f=0;function t(){if(document.visibilityState!=='visible'||b)return;b=true;var c=new AbortController(),id=setTimeout(function(){c.abort()},2000);fetch('/cgi-bin/sysinfo',{signal:c.signal,cache:'no-store'}).then(function(r){return r.text()}).then(function(s){clearTimeout(id);b=false;f=0;var p=s.trim().split('|');var e=document.getElementById('_cpu_val');if(e)e.textContent=(p[0]||'-')+'%';e=document.getElementById('_temp_val');if(e)e.textContent=p[1]||'-';}).catch(function(){clearTimeout(id);b=false;if(++f>5)f=5});}t();setInterval(t,1000);})();</script>
           EOF
 
-          # ---------- uci-defaults：全锥 + 注入首页 + 清缓存 + 自检日志 ----------
           cat > files/etc/uci-defaults/99-custom-defaults << 'EOF'
           #!/bin/sh
-
           uci set system.@system[0].timezone='CST-8'
           uci set system.@system[0].zonename='Asia/Shanghai'
           uci commit system
           uci set luci.main.lang='zh_Hans'
           uci commit luci
-
           uci set firewall.@defaults[0].fullcone='1'
           for z in $(uci show firewall | grep -E '\.name=' | sed -n "s/firewall.\([^=]*\)\.name='\([^']*\)'/\1 \2/p"); do
             sec=$(echo "$z" | awk '{print $1}')
@@ -163,37 +143,20 @@ CFGEOF
             uci set firewall.${sec}.fullcone='1'
             uci set firewall.${sec}.fullcone_proto='tcp udp udplite'
           done
-          uci -q get firewall.wan.name >/dev/null 2>&1 && {
-            uci set firewall.wan.fullcone='1'; uci set firewall.wan.fullcone_proto='tcp udp udplite'
-          }
-          uci -q get firewall.wan6.name >/dev/null 2>&1 && {
-            uci set firewall.wan6.fullcone='1'; uci set firewall.wan6.fullcone_proto='tcp udp udplite'
-          }
+          uci -q get firewall.wan.name >/dev/null 2>&1 && { uci set firewall.wan.fullcone='1'; uci set firewall.wan.fullcone_proto='tcp udp udplite'; }
+          uci -q get firewall.wan6.name >/dev/null 2>&1 && { uci set firewall.wan6.fullcone='1'; uci set firewall.wan6.fullcone_proto='tcp udp udplite'; }
           uci commit firewall
-
           uci -q del uhttpd.main.interpreter
           uci add_list uhttpd.main.interpreter='.cgi=/bin/sh'
           uci commit uhttpd
-
           INDEX=$(find /usr/lib/lua/luci/view /usr/share/luci/view -name "index.htm" 2>/dev/null | xargs grep -l 'Localtime\|Uptime' 2>/dev/null | head -1)
           [ -z "$INDEX" ] && INDEX=$(find /usr/lib/lua/luci/view /usr/share/luci/view -name "index.htm" 2>/dev/null | head -1)
-          if [ -n "$INDEX" ] && [ -f "$INDEX" ]; then
-            if ! grep -q '_cpu_val' "$INDEX"; then
-              awk 'BEGIN{r="<tr><td width=\"33%\"><%:CPU Usage%></td><td id=\"_cpu_val\">-</td></tr>\n<tr><td width=\"33%\"><%:Temperature%></td><td id=\"_temp_val\">-</td></tr>\n"} /<\/table>/&&!d{printf "%s",r;d=1}1' "$INDEX" > "$INDEX.tmp" && mv "$INDEX.tmp" "$INDEX"
-            fi
+          if [ -n "$INDEX" ] && [ -f "$INDEX" ] && ! grep -q '_cpu_val' "$INDEX"; then
+            awk 'BEGIN{r="<tr><td width=\"33%\"><%:CPU Usage%></td><td id=\"_cpu_val\">-</td></tr>\n<tr><td width=\"33%\"><%:Temperature%></td><td id=\"_temp_val\">-</td></tr>\n"}/<\/table>/&&!d{printf "%s",r;d=1}1' "$INDEX" > "$INDEX.tmp" && mv "$INDEX.tmp" "$INDEX"
           fi
-
           rm -rf /tmp/luci-*
           /etc/init.d/uhttpd restart
-
-          {
-            echo "INDEX=$INDEX"
-            ls -l /usr/bin/get_cpu /usr/bin/get_temp /www/cgi-bin/sysinfo
-            sh /usr/bin/get_cpu
-            sh /usr/bin/get_temp
-            curl -s http://127.0.0.1/cgi-bin/sysinfo
-            grep -n '_cpu_val\|_temp_val' "$INDEX" 2>/dev/null
-          } > /tmp/custom-overlay.log 2>&1
+          { echo "INDEX=$INDEX"; ls -l /usr/bin/get_cpu /usr/bin/get_temp /www/cgi-bin/sysinfo; sh /usr/bin/get_cpu; sh /usr/bin/get_temp; curl -s http://127.0.0.1/cgi-bin/sysinfo; grep -n '_cpu_val\|_temp_val' "$INDEX" 2>/dev/null; } > /tmp/custom-overlay.log 2>&1
           EOF
           chmod +x files/etc/uci-defaults/99-custom-defaults
 
@@ -204,11 +167,11 @@ CFGEOF
         run: |
           cd openwrt
           make download -j8
-          make ${{ env.MAKE_JOBS }} || make -j1 V=s
+          make -j$(nproc) || make -j1 V=s
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: OpenWrt-x86_64-squashfs
-          path: openwrt/bin/targets/x86_64/generic/*
+          path: openwrt/bin/targets/x86_64/generic/
           retention-days: 7
