@@ -139,6 +139,7 @@ jobs:
       run: |
         mkdir -p files/usr/bin
         mkdir -p files/www/cgi-bin
+        mkdir -p files/www/luci-static/resources/view/status/include
         mkdir -p files/etc/uci-defaults
 
         # ===== 1. CPU 占用脚本（0.2s 双采样） =====
@@ -188,7 +189,75 @@ jobs:
         CGIEOF
         chmod +x files/www/cgi-bin/sysinfo
 
-        # ===== 4. uci-defaults：Fullcone + 时区/语言 =====
+        # ===== 4. 副作用型 JS 模块：把 CPU/温度两行插进已有的"系统"表格 =====
+        cat > files/www/luci-static/resources/view/status/include/50_sysinfo.js << 'JSEOF'
+        'use strict';
+        'require baseclass';
+
+        function findSystemTable() {
+            var candidates = document.querySelectorAll('.table, .cbi-section-table, table');
+            for (var i = 0; i < candidates.length; i++) {
+                var el = candidates[i];
+                if (el.querySelector('#luci-sysinfo-cpu')) return el;
+                var txt = el.textContent || '';
+                if (txt.indexOf('Hostname') !== -1 || txt.indexOf('主机名') !== -1) {
+                    return el;
+                }
+            }
+            return null;
+        }
+
+        function makeRow(label, valueId) {
+            return E('div', { 'class': 'tr' }, [
+                E('div', { 'class': 'td left', 'width': '33%' }, label),
+                E('div', { 'class': 'td left' }, [
+                    E('span', { 'id': valueId }, '-')
+                ])
+            ]);
+        }
+
+        function startPolling() {
+            function tick() {
+                if (document.hidden) return;
+                var c = document.getElementById('luci-sysinfo-cpu');
+                var t = document.getElementById('luci-sysinfo-temp');
+                if (!c && !t) return;
+                var xhr = new XMLHttpRequest();
+                xhr.open('GET', '/cgi-bin/sysinfo', true);
+                xhr.timeout = 2000;
+                xhr.onload = function() {
+                    if (xhr.status !== 200) return;
+                    var p = xhr.responseText.trim().split('|');
+                    if (c && p[0] !== undefined) c.textContent = p[0] + '%';
+                    if (t && p[1] !== undefined) t.textContent = p[1];
+                };
+                xhr.send();
+            }
+            tick();
+            setInterval(tick, 1000);
+        }
+
+        var tries = 0;
+        var iv = setInterval(function() {
+            tries++;
+            if (tries > 40) { clearInterval(iv); return; }
+            var table = findSystemTable();
+            if (!table) return;
+            if (table.querySelector('#luci-sysinfo-cpu')) {
+                clearInterval(iv);
+                return;
+            }
+            table.appendChild(makeRow(_('CPU Usage'), 'luci-sysinfo-cpu'));
+            table.appendChild(makeRow(_('Temperature'), 'luci-sysinfo-temp'));
+            clearInterval(iv);
+            startPolling();
+        }, 200);
+
+        return baseclass.extend({});
+        JSEOF
+        chmod 644 files/www/luci-static/resources/view/status/include/50_sysinfo.js
+
+        # ===== 5. uci-defaults：Fullcone + 时区/语言 =====
         cat > files/etc/uci-defaults/99-custom-defaults << 'UCIEOF'
         #!/bin/sh
 
@@ -220,133 +289,47 @@ jobs:
         echo "==== files 覆盖已应用 ===="
         find files/ -type f
 
-    - name: Patch LuCI status include/10_system.js (inject CPU/temp rows)
+    - name: Patch overview.js to load 50_sysinfo module
       working-directory: openwrt
       run: |
-        echo "==== 定位 10_system.js ===="
-        SYS_JS=$(find feeds -path '*view/status/include/10_system.js' | head -1)
-        if [ -z "$SYS_JS" ]; then
-          echo "!! 未找到 10_system.js，列出候选："
-          find feeds -path '*view/status/include*' -type f | sort
+        echo "==== 定位 overview.js ===="
+        OVERVIEW=$(find feeds -path '*luci*view/status/overview.js' | head -1)
+        if [ -z "$OVERVIEW" ]; then
+          echo "!! 未找到 overview.js，候选："
+          find feeds -path '*view/status*' -type f | sort
           exit 1
         fi
-        echo "10_system.js = $SYS_JS"
+        echo "overview.js = $OVERVIEW"
 
-        python3 - "$SYS_JS" << 'PYEOF'
+        python3 - "$OVERVIEW" << 'PYEOF'
         import re, sys
 
         p = sys.argv[1]
         with open(p) as f:
             s = f.read()
 
-        if 'luci-sysinfo-cpu' in s:
+        if '50_sysinfo' in s:
             print('already patched, skip')
             sys.exit(0)
 
-        poll_code = """/* ==== injected: live CPU / Temperature updater ==== */
-        (function() {
-            function tick() {
-                if (document.hidden) return;
-                var c = document.getElementById('luci-sysinfo-cpu');
-                var t = document.getElementById('luci-sysinfo-temp');
-                if (!c && !t) return;
-                var xhr = new XMLHttpRequest();
-                xhr.open('GET', '/cgi-bin/sysinfo', true);
-                xhr.timeout = 2000;
-                xhr.onload = function() {
-                    if (xhr.status !== 200) return;
-                    var p = xhr.responseText.trim().split('|');
-                    if (c && p[0] !== undefined) c.textContent = p[0] + '%';
-                    if (t && p[1] !== undefined) t.textContent = p[1];
-                };
-                xhr.send();
-            }
-            setInterval(tick, 1000);
-            setTimeout(tick, 200);
-        })();
-        /* ==== end inject ==== */
-        """
+        anchor = re.search(r"^'require view\.status\.include\.\w+ as \w+';\s*$", s, re.M)
+        if not anchor:
+            anchor = re.search(r"^'require view\.status[^']*';\s*$", s, re.M)
+        if not anchor:
+            print('!! 找不到 require 锚点，文件头部：')
+            print('\n'.join(s.splitlines()[:40]))
+            sys.exit(1)
 
-        rows_push_inject = """
-        \t\trows.push(E('tr', { 'class': 'tr' }, [
-        \t\t\tE('td', { 'class': 'td left', 'width': '33%' }, _('CPU Usage')),
-        \t\t\tE('td', { 'class': 'td left' }, [ E('span', { 'id': 'luci-sysinfo-cpu' }, '-') ])
-        \t\t]));
-        \t\trows.push(E('tr', { 'class': 'tr' }, [
-        \t\t\tE('td', { 'class': 'td left', 'width': '33%' }, _('Temperature')),
-        \t\t\tE('td', { 'class': 'td left' }, [ E('span', { 'id': 'luci-sysinfo-temp' }, '-') ])
-        \t\t]));
-        """
-
-        rows_arr_inject = """
-        \t\t\tE('tr', { 'class': 'tr' }, [
-        \t\t\t\tE('td', { 'class': 'td left', 'width': '33%' }, _('CPU Usage')),
-        \t\t\t\tE('td', { 'class': 'td left' }, [ E('span', { 'id': 'luci-sysinfo-cpu' }, '-') ])
-        \t\t\t]),
-        \t\t\tE('tr', { 'class': 'tr' }, [
-        \t\t\t\tE('td', { 'class': 'td left', 'width': '33%' }, _('Temperature')),
-        \t\t\t\tE('td', { 'class': 'td left' }, [ E('span', { 'id': 'luci-sysinfo-temp' }, '-') ])
-        \t\t\t]),"""
-
-        pushes = list(re.finditer(r'rows\.push\(', s))
-        if pushes:
-            start = pushes[-1].start()
-            i = s.index('(', start)
-            depth = 0
-            j = i
-            end = -1
-            while j < len(s):
-                if s[j] == '(':
-                    depth += 1
-                elif s[j] == ')':
-                    depth -= 1
-                    if depth == 0:
-                        k = j + 1
-                        while k < len(s) and s[k] in ' \t':
-                            k += 1
-                        if k < len(s) and s[k] == ';':
-                            k += 1
-                        end = k
-                        break
-                j += 1
-            if end < 0:
-                print('!! rows.push 结尾定位失败')
-                sys.exit(1)
-            s = s[:end] + rows_push_inject + s[end:]
-        else:
-            m = re.search(r'var\s+rows\s*=\s*\[', s)
-            if not m:
-                print('!! 找不到 rows 定义，文件头部如下：')
-                print('\n'.join(s.splitlines()[:60]))
-                sys.exit(1)
-            i = s.index('[', m.start())
-            depth = 0
-            j = i
-            end = -1
-            while j < len(s):
-                if s[j] == '[':
-                    depth += 1
-                elif s[j] == ']':
-                    depth -= 1
-                    if depth == 0:
-                        end = j
-                        break
-                j += 1
-            if end < 0:
-                print('!! rows 数组结尾定位失败')
-                sys.exit(1)
-            s = s[:end] + rows_arr_inject + '\n\t\t' + s[end:]
-
-        s = poll_code + '\n' + s
+        ins = anchor.end()
+        s = s[:ins] + "\n'require view.status.include.50_sysinfo as sysinfo';" + s[ins:]
 
         with open(p, 'w') as f:
             f.write(s)
-
         print('patched ok')
         PYEOF
 
         echo "==== 验证注入 ===="
-        grep -n 'luci-sysinfo-cpu\|luci-sysinfo-temp' "$SYS_JS" || { echo "!! 注入未生效"; exit 1; }
+        grep -n '50_sysinfo' "$OVERVIEW" || { echo "!! 注入未生效"; exit 1; }
 
     - name: SSH debug connection
       if: github.event.inputs.ssh == 'true'
