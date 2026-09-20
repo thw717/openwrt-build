@@ -1,12 +1,11 @@
 name: Build OpenWrt 25.12.5 with Full Cone NAT
 
 on:
-  workflow_dispatch: # 仅手动触发工作流
+  workflow_dispatch:
 
 env:
-  REPO_URL: https://github.com
+  REPO_URL: https://github.com/openwrt/openwrt
   REPO_BRANCH: v25.12.5
-  CONFIG_FILE: .config
 
 jobs:
   build:
@@ -45,46 +44,34 @@ jobs:
     - name: Inject mufeng05 OpenWrt Sonic Fullcone Patch
       working-directory: ./openwrt
       run: |
-        # 一键应用所有 Fullcone 补丁
-        curl -sSL https://githubusercontent.com | bash
+        curl -sSL https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
 
     - name: Load Custom Configuration & Packages
       working-directory: ./openwrt
       run: |
-        # 设置 x86/64 目标平台架构
         echo "CONFIG_TARGET_x86=y" >> .config
         echo "CONFIG_TARGET_x86_64=y" >> .config
         echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
-        
-        # 写入你请求安装的组件列表
-        PACKAGES=(
-          luci-theme-bootstrap
-          luci-i18n-base-zh-cn
-          luci-i18n-firewall-zh-cn
-          luci-app-ttyd
-          miniupnpd-nftables
-          luci-app-upnp
-          luci-i18n-upnp-zh-cn
-          ddns-scripts
-          luci-app-ddns
-          ddns-scripts-cloudflare
-          ddns-scripts-dnspod
-          curl
-          ca-certificates
-          luci-i18n-ddns-zh-cn
-          luci-app-uhttpd
-          luci-i18n-uhttpd-zh-cn
-          luci-app-statistics
-          collectd-mod-thermal
-          kmod-thermal
-          kmod-hwmon-core
-        )
-        
-        for pkg in "${PACKAGES[@]}"; do
-          echo "CONFIG_PACKAGE_$pkg=y" >> .config
-        done
-        
-        # 补全依赖并生成最终 .config
+        echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> .config
+        echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
+        echo "CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y" >> .config
+        echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
+        echo "CONFIG_PACKAGE_miniupnpd-nftables=y" >> .config
+        echo "CONFIG_PACKAGE_luci-app-upnp=y" >> .config
+        echo "CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y" >> .config
+        echo "CONFIG_PACKAGE_ddns-scripts=y" >> .config
+        echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
+        echo "CONFIG_PACKAGE_ddns-scripts-cloudflare=y" >> .config
+        echo "CONFIG_PACKAGE_ddns-scripts-dnspod=y" >> .config
+        echo "CONFIG_PACKAGE_curl=y" >> .config
+        echo "CONFIG_PACKAGE_ca-certificates=y" >> .config
+        echo "CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y" >> .config
+        echo "CONFIG_PACKAGE_luci-app-uhttpd=y" >> .config
+        echo "CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y" >> .config
+        echo "CONFIG_PACKAGE_luci-app-statistics=y" >> .config
+        echo "CONFIG_PACKAGE_collectd-mod-thermal=y" >> .config
+        echo "CONFIG_PACKAGE_kmod-thermal=y" >> .config
+        echo "CONFIG_PACKAGE_kmod-hwmon-core=y" >> .config
         make defconfig
 
     - name: Download Package Source
@@ -98,18 +85,17 @@ jobs:
       working-directory: ./openwrt
       run: |
         echo -e "$(nproc) thread compile"
-        # 第一次编译建议单线程以防因依赖冲突报错
         make -j1 V=s
 
     - name: Organize Compiled Files
       working-directory: ./openwrt
       run: |
-        cd bin/targets/x86/64
-        rm -rf packages
-        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+        mkdir -p bin_artifact/
+        cp -f bin/targets/x86/64/*img* bin_artifact/ 2>/dev/null || true
+        cp -f bin/targets/x86/64/*manifest* bin_artifact/ 2>/dev/null || true
 
     - name: Upload Firmware Artifact
       uses: actions/upload-artifact@v4
       with:
         name: OpenWrt_v25.12.5_Firmware
-        path: ${{ env.FIRMWARE_PATH }}
+        path: openwrt/bin_artifact/
