@@ -74,167 +74,105 @@ jobs:
         run: |
           set -e
 
-          python3 <<'PY'
+          cat > /tmp/patch_temp.py <<'PY'
           from pathlib import Path
           import json
+          import re
 
           pkg = Path("package/luci-app-temp-status")
           js = pkg / "htdocs/luci-static/resources/view/status/include/27_temperature.js"
           acl = pkg / "root/usr/share/rpcd/acl.d/luci-app-temp-status.json"
-
           text = js.read_text(encoding="utf-8")
 
           if "'require fs';" not in text:
-              text = text.replace(
-                  "'require rpc';",
-                  "'require rpc';\n'require fs';",
-                  1
-              )
+              text = text.replace("'require rpc';", "'require rpc';\\n'require fs';", 1)
 
-          if "\tfilterX86PkgTemp(data) {" not in text:
-              needle = "\tload() {\n"
-              method = """
+          filter_method = """
           filterX86PkgTemp(data) {
-              if(!data || !data.temp)
+              if (!data || !data.temp)
                   return Promise.resolve(data);
-
               let paths = Object.keys(data.temp);
-
               return Promise.all(paths.map((path) => {
-                  let typePath = null;
-
-                  if(path.endsWith('/temp'))
-                      typePath = path.slice(0, -5) + '/type';
-
-                  if(!typePath)
+                  let typePath = path.endsWith('/temp') ? path.slice(0, -5) + '/type' : null;
+                  if (!typePath)
                       return Promise.resolve(null);
-
-                  return fs.read(typePath).then((type) => {
-                      return (type && type.trim() == 'x86_pkg_temp') ? path : null;
-                  }).catch(() => null);
+                  return fs.read(typePath).then((type) =>
+                      (type && type.trim() == 'x86_pkg_temp') ? path : null
+                  ).catch(() => null);
               })).then((result) => {
                   let allowed = new Set(result.filter((path) => path !== null));
                   let temp = {};
-
-                  for(let path of Object.keys(data.temp)) {
-                      if(allowed.has(path))
-                          temp[path] = data.temp[path];
-                  }
-
+                  for (let path of Object.keys(data.temp))
+                      if (allowed.has(path)) temp[path] = data.temp[path];
                   let sensors = {};
-
-                  if(data.sensors) {
-                      for(let [group, items] of Object.entries(data.sensors)) {
-                          let filteredItems = [];
-
-                          for(let item of items) {
-                              if(!item.sources)
-                                  continue;
-
-                              let sources = item.sources.filter((source) =>
-                                  source.path && allowed.has(source.path)
-                              );
-
-                              if(sources.length > 0) {
+                  if (data.sensors) {
+                      for (let [group, items] of Object.entries(data.sensors)) {
+                          let filtered = [];
+                          for (let item of items) {
+                              if (!item.sources) continue;
+                              let sources = item.sources.filter((source) => source.path && allowed.has(source.path));
+                              if (sources.length) {
                                   let copy = Object.assign({}, item);
                                   copy.sources = sources;
-                                  filteredItems.push(copy);
+                                  filtered.push(copy);
                               }
                           }
-
-                          if(filteredItems.length > 0)
-                              sensors[group] = filteredItems;
+                          if (filtered.length) sensors[group] = filtered;
                       }
                   }
-
-                  return {
-                      sensors: sensors,
-                      temp: temp
-                  };
+                  return { sensors: sensors, temp: temp };
               });
           },
-
           """
-              if needle not in text:
-                  raise SystemExit("Cannot find load() in 27_temperature.js")
-              text = text.replace(needle, method + needle, 1)
 
-          old = """	load() {
-			this.restoreSettingsFromLocalStorage();
-			if(this.sensorsData) {
-				return (this.sensorsPath.length > 0) ?
-					L.resolveDefault(this.callTempData(this.sensorsPath), null) :
-						Promise.resolve(null);
-			} else {
-				return L.resolveDefault(this.callSensors(), null);
-			};
-		},"""
+          if "filterX86PkgTemp(data)" not in text:
+              text = text.replace("\\tload() {", filter_method + "\\tload() {", 1)
 
-          new = """	load() {
-			this.restoreSettingsFromLocalStorage();
-			if(this.sensorsData) {
-				return (this.sensorsPath.length > 0) ?
-					L.resolveDefault(this.callTempData(this.sensorsPath), null)
-						.then((data) => this.filterX86PkgTemp(data)) :
-					Promise.resolve(null);
-			} else {
-				return L.resolveDefault(this.callSensors(), null)
-					.then((data) => this.filterX86PkgTemp(data));
-			};
-		},"""
+          pattern = r"\\tload\\(\\) \\{.*?\\n\\t\\},\\n\\n\\trender\\(data\\) \\{"
+          replacement = """\\tload() {
+          \\t\\tthis.restoreSettingsFromLocalStorage();
+          \\t\\tif (this.sensorsData) {
+          \\t\\t\\treturn (this.sensorsPath.length > 0) ?
+          \\t\\t\\t\\tL.resolveDefault(this.callTempData(this.sensorsPath), null)
+          \\t\\t\\t\\t\\t.then((data) => this.filterX86PkgTemp(data)) :
+          \\t\\t\\t\\tPromise.resolve(null);
+          \\t\\t} else {
+          \\t\\t\\treturn L.resolveDefault(this.callSensors(), null)
+          \\t\\t\\t\\t.then((data) => this.filterX86PkgTemp(data));
+          \\t\\t};
+          \\t},
 
-          if old not in text:
-              raise SystemExit("Cannot find expected load() block in 27_temperature.js")
-
-          text = text.replace(old, new, 1)
+          \\trender(data) {"""
+          text, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+          if count != 1:
+              raise SystemExit("Could not patch temp-status load()")
           js.write_text(text, encoding="utf-8")
 
-          acl_data = json.loads(acl.read_text(encoding="utf-8"))
-          section = acl_data["luci-app-temp-status"]
-          read = section.setdefault("read", {})
-          files = read.setdefault("file", {})
+          data = json.loads(acl.read_text(encoding="utf-8"))
+          section = data.setdefault("luci-app-temp-status", {})
+          files = section.setdefault("read", {}).setdefault("file", {})
           files["/sys/class/thermal/thermal_zone*/type"] = ["read"]
           files["/sys/class/thermal/thermal_zone*/temp"] = ["read"]
-          acl.write_text(
-              json.dumps(acl_data, ensure_ascii=False, indent=2) + "\n",
-              encoding="utf-8"
-          )
-
-          po = pkg / "po" / "zh_Hans"
-          po.mkdir(parents=True, exist_ok=True)
-          (po / "temp-status.po").write_text(
-              """msgid ""
-          msgstr ""
-          "Language: zh_Hans\\n"
-          "MIME-Version: 1.0\\n"
-          "Content-Type: text/plain; charset=UTF-8\\n"
-          "Content-Transfer-Encoding: 8bit\\n"
-
-          msgid "Temperature"
-          msgstr "温度"
-
-          msgid "Sensor"
-          msgstr "传感器"
-
-          msgid "Switch view"
-          msgstr "切换视图"
-
-          msgid "Show hidden sensors"
-          msgstr "显示隐藏的传感器"
-
-          msgid "No temperature sensors available"
-          msgstr "没有可用的温度传感器"
-
-          msgid "Hide"
-          msgstr "隐藏"
-          """,
-              encoding="utf-8"
-          )
+          acl.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
           PY
 
-          echo "===== Verify temperature patch ====="
-          grep -n -E "require fs|filterX86PkgTemp|x86_pkg_temp" \
-            package/luci-app-temp-status/htdocs/luci-static/resources/view/status/include/27_temperature.js
+          python3 /tmp/patch_temp.py
+          rm -f /tmp/patch_temp.py
+          grep -n -E "require fs|filterX86PkgTemp|x86_pkg_temp" package/luci-app-temp-status/htdocs/luci-static/resources/view/status/include/27_temperature.js
+
+      - name: Force LuCI Simplified Chinese language
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-luci-zh-cn <<'EOF'
+          #!/bin/sh
+          uci -q set luci.main.lang='zh_cn'
+          uci -q commit luci
+          exit 0
+          EOF
+          chmod 0755 files/etc/uci-defaults/99-luci-zh-cn
 
       - name: Configure OpenWrt 25.12
         working-directory: openwrt
@@ -284,7 +222,6 @@ jobs:
 
           CONFIG_PACKAGE_luci-app-cpu-status-mini=y
           CONFIG_PACKAGE_luci-app-temp-status=y
-          CONFIG_PACKAGE_luci-i18n-temp-status-zh-cn=y
           EOF
 
           make defconfig
