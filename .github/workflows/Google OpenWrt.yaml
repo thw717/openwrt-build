@@ -7,7 +7,6 @@ env:
   REPO_URL: https://github.com
   REPO_BRANCH: v25.12.5
   CONFIG_FILE: .config
-  DIY_SH: diy.sh
 
 jobs:
   build:
@@ -38,24 +37,20 @@ jobs:
         ln -sf workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
     - name: Update & Install Feeds
-      path: openwrt
+      working-directory: ./openwrt
       run: |
-        cd openwrt
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
     - name: Inject mufeng05 OpenWrt Sonic Fullcone Patch
-      path: openwrt
+      working-directory: ./openwrt
       run: |
-        cd openwrt
         # 一键应用所有 Fullcone 补丁
-        curl -sSL https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
+        curl -sSL https://githubusercontent.com | bash
 
     - name: Load Custom Configuration & Packages
-      path: openwrt
+      working-directory: ./openwrt
       run: |
-        cd openwrt
-        
         # 设置 x86/64 目标平台架构
         echo "CONFIG_TARGET_x86=y" >> .config
         echo "CONFIG_TARGET_x86_64=y" >> .config
@@ -93,31 +88,28 @@ jobs:
         make defconfig
 
     - name: Download Package Source
-      path: openwrt
+      working-directory: ./openwrt
       run: |
-        cd openwrt
         make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
     - name: Compile OpenWrt Firmware
-      path: openwrt
+      working-directory: ./openwrt
       run: |
-        cd openwrt
         echo -e "$(nproc) thread compile"
-        # 第一次编译建议单线程以防因依赖冲突报错，如果你对源码树信心充足，可改为 make -j$(nproc)
+        # 第一次编译建议单线程以防因依赖冲突报错
         make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Organize Compiled Files
-      path: openwrt
+      working-directory: ./openwrt
       run: |
-        cd openwrt/bin/targets/x86/64
+        cd bin/targets/x86/64
         rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
 
     - name: Upload Firmware Artifact
-      uses: actions/checkout@v6
+      uses: actions/upload-artifact@v4
       with:
         name: OpenWrt_v25.12.5_Firmware
-        path: ${{ env.FIRMWARE }}
+        path: ${{ env.FIRMWARE_PATH }}
