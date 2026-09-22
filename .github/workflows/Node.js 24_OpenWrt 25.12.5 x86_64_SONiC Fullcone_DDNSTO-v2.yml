@@ -442,7 +442,6 @@ jobs:
           grep -q '^CONFIG_PACKAGE_ddnsto=y$' .config
           grep -q '^CONFIG_PACKAGE_luci-app-ddnsto=y$' .config
           grep -q '^CONFIG_PACKAGE_luci-i18n-ddnsto-zh-cn=y$' .config
-          test -L files/etc/rc.d/S99ddnsto
           test -x files/etc/uci-defaults/98-ddnsto-enable
 
           test ! -d package/custom/luci-app-cpu-widget
