@@ -1,4 +1,4 @@
-name: OpenWrt 25.12.5 x86_64_SONiC Fullcone_DDNSTO
+name: Node.js 24_OpenWrt 25.12.5 x86_64_SONiC Fullcone_DDNSTO
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install build dependencies
         run: |
@@ -528,7 +528,7 @@ jobs:
           \) -print -quit)"
 
       - name: Upload firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: OpenWrt-25.12.5-x86_64-SonicFullcone-DDNSTO-ImmortalCPUStatus
           path: openwrt/bin/targets/x86/64/*
