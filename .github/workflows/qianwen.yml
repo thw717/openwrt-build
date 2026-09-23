@@ -1,0 +1,621 @@
+name: Build OpenWrt 25.12.5 x86_64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_VERSION: v25.12.5
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gettext git \
+            libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync unzip zlib1g-dev file curl wget ca-certificates
+
+      - name: Clone OpenWrt 25.12.5
+        run: |
+          set -e
+          git clone --depth=1 --branch "${OPENWRT_VERSION}" \
+            https://github.com/openwrt/openwrt.git openwrt
+
+      - name: Update and install official feeds
+        working-directory: openwrt
+        run: |
+          set -e
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Apply SONiC Fullcone
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          curl -fsSL \
+            https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh \
+            -o /tmp/add_sonic_fullcone.sh
+          bash /tmp/add_sonic_fullcone.sh
+          rm -f /tmp/add_sonic_fullcone.sh
+
+      - name: Add ImmortalWrt-style CPU status to LuCI overview
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          STATUS_JS="feeds/luci/modules/luci-mod-status/htdocs/luci-static/resources/view/status/include/10_system.js"
+          STATUS_ACL="feeds/luci/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status-index.json"
+
+          test -f "${STATUS_JS}"
+          test -f "${STATUS_ACL}"
+
+          cat > "${STATUS_JS}" <<'EOF'
+          'use strict';
+
+          'require baseclass';
+          'require fs';
+          'require poll';
+          'require rpc';
+          'require uci';
+
+          var callLuciVersion = rpc.declare({
+              object: 'luci',
+              method: 'getVersion'
+          });
+
+          var callSystemBoard = rpc.declare({
+              object: 'system',
+              method: 'board'
+          });
+
+          var callSystemInfo = rpc.declare({
+              object: 'system',
+              method: 'info'
+          });
+
+          function parseCPUStat(text) {
+              if (typeof text != 'string')
+                  return null;
+
+              var line = text.split('\n').find(function(line) {
+                  return line.indexOf('cpu ') == 0;
+              });
+
+              if (!line)
+                  return null;
+
+              var values = line.trim().split(/\s+/).slice(1).map(Number);
+
+              if (values.length < 4 || values.some(isNaN))
+                  return null;
+
+              var idle = values[3] + (values[4] || 0);
+              var total = values.reduce(function(sum, value) {
+                  return sum + value;
+              }, 0);
+
+              return { idle: idle, total: total };
+          }
+
+          function getCPUUsage() {
+              return L.resolveDefault(fs.read('/proc/stat'), '').then(function(first) {
+                  return new Promise(function(resolve) {
+                      setTimeout(resolve, 250);
+                  }).then(function() {
+                      return L.resolveDefault(fs.read('/proc/stat'), '');
+                  }).then(function(second) {
+                      var a = parseCPUStat(first);
+                      var b = parseCPUStat(second);
+
+                      if (!a || !b)
+                          return null;
+
+                      var total = b.total - a.total;
+                      var idle = b.idle - a.idle;
+
+                      if (total <= 0)
+                          return null;
+
+                      return Math.max(0, Math.min(100,
+                          Math.round((1 - idle / total) * 100)));
+                  });
+              });
+          }
+
+          function getCPUPackageTemp() {
+              return L.resolveDefault(fs.list('/sys/class/thermal'), []).then(function(entries) {
+                  var zones = entries.filter(function(entry) {
+                      return entry && /^thermal_zone[0-9]+$/.test(entry.name);
+                  });
+
+                  return Promise.all(zones.map(function(zone) {
+                      var base = '/sys/class/thermal/' + zone.name;
+
+                      return L.resolveDefault(fs.read(base + '/type'), '').then(function(type) {
+                          if (type.trim() != 'x86_pkg_temp')
+                              return null;
+
+                          return L.resolveDefault(fs.read(base + '/temp'), '').then(function(temp) {
+                              var value = parseInt(String(temp).trim(), 10);
+
+                              if (!isFinite(value))
+                                  return null;
+
+                              return (value / 1000).toFixed(1).replace(/\.0$/, '') + '°C';
+                          });
+                      });
+                  })).then(function(values) {
+                      return values.find(function(value) {
+                          return value !== null;
+                      }) || null;
+                  });
+              });
+          }
+
+          function getMetrics() {
+              return Promise.all([
+                  L.resolveDefault(getCPUUsage(), null),
+                  L.resolveDefault(getCPUPackageTemp(), null)
+              ]).then(function(values) {
+                  return {
+                      cpu: values[0],
+                      temp: values[1]
+                  };
+              });
+          }
+
+          return baseclass.extend({
+              title: _('System'),
+
+              load: function() {
+                  return Promise.all([
+                      L.resolveDefault(callSystemBoard(), {}),
+                      L.resolveDefault(callSystemInfo(), {}),
+                      L.resolveDefault(callLuciVersion(), {
+                          revision: _('unknown version'),
+                          branch: 'LuCI'
+                      }),
+                      uci.load('system'),
+                      L.resolveDefault(getMetrics(), { cpu: null, temp: null })
+                  ]);
+              },
+
+              render: function(data) {
+                  var boardinfo = data[0],
+                      systeminfo = data[1],
+                      luciversion = data[2],
+                      metrics = data[4];
+
+                  luciversion = luciversion.branch + ' ' + luciversion.revision;
+
+                  var datestr = null;
+                  var unixtime = Math.floor(Date.now() / 1000);
+
+                  if (unixtime) {
+                      var date = new Date(unixtime * 1000),
+                          zn = uci.get('system', '@system[0]', 'zonename')?.replaceAll(' ', '_') || 'UTC',
+                          ts = uci.get('system', '@system[0]', 'clock_timestyle') || 0,
+                          hc = uci.get('system', '@system[0]', 'clock_hourcycle') || 0;
+
+                      datestr = new Intl.DateTimeFormat(undefined, {
+                          dateStyle: 'medium',
+                          timeStyle: (ts == 0) ? 'long' : 'full',
+                          hourCycle: (hc == 0) ? undefined : hc,
+                          timeZone: zn
+                      }).format(date);
+                  }
+
+                  var fields = [
+                      _('Hostname'), boardinfo.hostname,
+                      _('Model'), boardinfo.model,
+                      _('Architecture'), boardinfo.system,
+                      _('Target Platform'), (L.isObject(boardinfo.release) ? boardinfo.release.target : ''),
+                      _('Firmware Version'), (L.isObject(boardinfo.release) ? boardinfo.release.description + ' / ' : '') + (luciversion || ''),
+                      _('Kernel Version'), boardinfo.kernel,
+                      _('Local Time'), datestr,
+                      _('Uptime'), systeminfo.uptime ? '%t'.format(systeminfo.uptime) : null,
+                      _('Load Average'), Array.isArray(systeminfo.load) ? '%.2f, %.2f, %.2f'.format(
+                          systeminfo.load[0] / 65535.0,
+                          systeminfo.load[1] / 65535.0,
+                          systeminfo.load[2] / 65535.0
+                      ) : null,
+                      'CPU 使用率', metrics.cpu != null ? metrics.cpu + '%' : '?',
+                      'CPU 温度', metrics.temp != null ? metrics.temp : '?'
+                  ];
+
+                  var table = E('table', { 'class': 'table' });
+                  var cpuCell, tempCell;
+
+                  for (var i = 0; i < fields.length; i += 2) {
+                      var value = (fields[i + 1] != null) ? fields[i + 1] : '?';
+                      var cell = E('td', {
+                          'class': 'td left'
+                      }, [ value ]);
+
+                      var row = E('tr', { 'class': 'tr' }, [
+                          E('td', {
+                              'class': 'td left',
+                              'width': '33%'
+                          }, [ fields[i] ]),
+                          cell
+                      ]);
+
+                      table.appendChild(row);
+
+                      if (fields[i] == 'CPU 使用率')
+                          cpuCell = cell;
+                      else if (fields[i] == 'CPU 温度')
+                          tempCell = cell;
+                  }
+
+                  var lastCPU = metrics.cpu;
+                  var lastTemp = metrics.temp;
+
+                  poll.add(function() {
+                      return getMetrics().then(function(next) {
+                          // Keep the last known good value if one sample fails.
+                          if (next.cpu != null) {
+                              lastCPU = next.cpu;
+                              if (cpuCell)
+                                  cpuCell.textContent = lastCPU + '%';
+                          }
+
+                          if (next.temp != null) {
+                              lastTemp = next.temp;
+                              if (tempCell)
+                                  tempCell.textContent = lastTemp;
+                          }
+                      });
+                  }, 1);
+
+                  return table;
+              }
+          });
+          EOF
+
+          python3 - "${STATUS_ACL}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          data = json.loads(path.read_text(encoding="utf-8"))
+
+          group = data.setdefault("luci-mod-status-index", {})
+          read = group.setdefault("read", {})
+          files = read.setdefault("file", {})
+
+          files["/proc/stat"] = ["read"]
+          files["/sys/class/thermal"] = ["list"]
+          files["/sys/class/thermal/thermal_zone*"] = ["list"]
+          files["/sys/class/thermal/thermal_zone*/type"] = ["read"]
+          files["/sys/class/thermal/thermal_zone*/temp"] = ["read"]
+
+          path.write_text(
+              json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8"
+          )
+          PY
+
+          node --check "${STATUS_JS}"
+          python3 -m json.tool "${STATUS_ACL}" >/dev/null
+
+          grep -n -E "getCPUUsage|getCPUPackageTemp|x86_pkg_temp|CPU usage" "${STATUS_JS}"
+          grep -n -E "/proc/stat|thermal_zone.*/type|thermal_zone.*/temp" "${STATUS_ACL}"
+      - name: Force LuCI Simplified Chinese language
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-luci-zh-cn <<'EOF'
+          #!/bin/sh
+          uci -q set luci.main.lang='zh_cn'
+          uci -q commit luci
+          exit 0
+          EOF
+          chmod 0755 files/etc/uci-defaults/99-luci-zh-cn
+
+      - name: Configure OpenWrt 25.12
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-base=y
+          CONFIG_PACKAGE_luci-mod-status=y
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+
+          CONFIG_LUCI_LANG_zh_Hans=y
+
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=y
+
+          CONFIG_PACKAGE_luci-app-ttyd=y
+
+          CONFIG_PACKAGE_miniupnpd-nftables=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+          CONFIG_PACKAGE_ddns-scripts-dnspod=y
+
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-certificates=y
+
+          CONFIG_PACKAGE_luci-app-uhttpd=y
+
+          CONFIG_PACKAGE_luci-app-statistics=y
+          CONFIG_PACKAGE_collectd-mod-thermal=y
+
+          CONFIG_PACKAGE_kmod-thermal=y
+          CONFIG_PACKAGE_kmod-hwmon-core=y
+
+          EOF
+
+          make defconfig
+
+      - name: Verify configuration
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          grep -q '^CONFIG_LUCI_LANG_zh_Hans=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-base-zh-cn=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y$' .config
+          test ! -d package/custom/luci-app-cpu-widget
+
+      - name: Download sources
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          make download -j"$(nproc)"
+
+      - name: Build firmware
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          make -j"$(nproc)"
+      - name: Inject DDNSTO into firmware
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          # Find the rootfs directory - try multiple strategies for OpenWrt compatibility
+          ROOTFS=""
+
+          # Strategy 1: staging_dir/target-*/root-* (most reliable across OpenWrt versions)
+          ROOTFS="$(find staging_dir/target-* -maxdepth 1 -type d -name 'root-*' -print -quit 2>/dev/null)"
+
+          # Strategy 2: build_dir/target-*/root-* (alternative path)
+          if [ -z "${ROOTFS}" ]; then
+            ROOTFS="$(find build_dir/target-* -maxdepth 1 -type d -name 'root-*' -print -quit 2>/dev/null)"
+          fi
+
+          # Strategy 3: recursive find for root-x86_64
+          if [ -z "${ROOTFS}" ]; then
+            ROOTFS="$(find . -name 'root-x86_64' -type d -print -quit 2>/dev/null)"
+          fi
+
+          # Strategy 4: recursive find for any root-* directory
+          if [ -z "${ROOTFS}" ]; then
+            ROOTFS="$(find . -name 'root-*' -type d -print -quit 2>/dev/null)"
+          fi
+
+          echo "Rootfs: ${ROOTFS}"
+
+          # Debug: if not found, show what's available
+          if [ -z "${ROOTFS}" ]; then
+            echo "ERROR: rootfs directory not found!"
+            echo "Debugging info:"
+            echo "  pwd: $(pwd)"
+            echo "  build_dir exists: $(test -d build_dir && echo YES || echo NO)"
+            if [ -d build_dir ]; then
+              echo "  build_dir contents:"
+              ls -la build_dir/ 2>/dev/null
+              echo "  build_dir/target-* contents:"
+              ls -la build_dir/target-*/ 2>/dev/null
+            fi
+            echo "  staging_dir exists: $(test -d staging_dir && echo YES || echo NO)"
+            if [ -d staging_dir ]; then
+              echo "  staging_dir contents:"
+              ls -la staging_dir/ 2>/dev/null
+              echo "  staging_dir/target-* contents:"
+              ls -la staging_dir/target-*/ 2>/dev/null
+            fi
+            echo "  All root-* directories:"
+            find . -name 'root-*' -type d 2>/dev/null | head -20
+            exit 1
+          fi
+
+          test -n "${ROOTFS}"
+          echo "Using rootfs: ${ROOTFS}"
+
+          # Download DDNSTO packages for x86_64
+          BASE_URL="http://fw.koolcenter.com/binary/ddnsto/openwrt"
+          echo "Downloading DDNSTO packages..."
+          curl -fsSL -o /tmp/ddnsto_x86_64.ipk "${BASE_URL}/ddnsto_x86_64.ipk"
+          curl -fsSL -o /tmp/luci-app-ddnsto.ipk "${BASE_URL}/luci-app-ddnsto.ipk"
+          curl -fsSL -o /tmp/luci-i18n-ddnsto-zh-cn.ipk "${BASE_URL}/luci-i18n-ddnsto-zh-cn.ipk"
+
+          # Verify downloads
+          echo "Verifying downloaded packages..."
+          for ipk in /tmp/ddnsto_x86_64.ipk /tmp/luci-app-ddnsto.ipk /tmp/luci-i18n-ddnsto-zh-cn.ipk; do
+            if [ ! -s "${ipk}" ]; then
+              echo "ERROR: Failed to download or empty file: ${ipk}"
+              exit 1
+            fi
+            echo "  $(basename ${ipk}): $(du -h ${ipk} | cut -f1)"
+          done
+
+          # Extract packages into rootfs
+          echo "Extracting DDNSTO packages into rootfs..."
+          for ipk in /tmp/ddnsto_x86_64.ipk /tmp/luci-app-ddnsto.ipk /tmp/luci-i18n-ddnsto-zh-cn.ipk; do
+            echo "Extracting $(basename ${ipk})..."
+            # Extract ipk: try tar directly first (some ipk are plain tar.gz), fallback to ar
+            if ! tar xzf "${ipk}" data.tar.gz -C "${ROOTFS}" 2>/dev/null; then
+              (cd /tmp && ar x "${ipk}" 2>/dev/null && tar xzf data.tar.gz -C "${ROOTFS}" 2>/dev/null)
+              rm -f /tmp/control.tar.gz /tmp/data.tar.gz /tmp/debian-binary 2>/dev/null
+            fi
+          done
+
+          # Ensure init.d script is executable
+          if [ -f "${ROOTFS}/etc/init.d/ddnsto" ]; then
+            chmod +x "${ROOTFS}/etc/init.d/ddnsto"
+            echo "Init script permissions set"
+          else
+            echo "WARNING: /etc/init.d/ddnsto not found"
+          fi
+
+          # Ensure binary is executable
+          if [ -f "${ROOTFS}/usr/bin/ddnsto" ]; then
+            chmod +x "${ROOTFS}/usr/bin/ddnsto"
+            echo "Binary permissions set"
+            file "${ROOTFS}/usr/bin/ddnsto"
+          else
+            echo "WARNING: /usr/bin/ddnsto not found"
+          fi
+
+          # Create rc.d symlinks for auto-start
+          mkdir -p "${ROOTFS}/etc/rc.d"
+          ln -sf ../init.d/ddnsto "${ROOTFS}/etc/rc.d/S95ddnsto"
+          ln -sf ../init.d/ddnsto "${ROOTFS}/etc/rc.d/K15ddnsto"
+          echo "RC symlinks created"
+
+          # Ensure config file exists
+          mkdir -p "${ROOTFS}/etc/config"
+          if [ -f "${ROOTFS}/etc/config/ddnsto" ]; then
+            echo "DDNSTO config found"
+          else
+            echo "Creating default DDNSTO config"
+            printf "config global\n\toption enabled '1'\n\toption token ''\n" > "${ROOTFS}/etc/config/ddnsto"
+          fi
+
+          # Verify injected files
+          echo "===== DDNSTO files in rootfs ====="
+          find "${ROOTFS}" -path '*/ddnsto*' -type f | sort
+          echo "===== RC symlinks ====="
+          ls -la "${ROOTFS}/etc/rc.d/"*ddnsto* 2>/dev/null || echo "No rc.d symlinks found"
+
+          # Rebuild firmware image
+          echo "Rebuilding firmware image..."
+          make image
+
+
+      - name: Verify Chinese catalogs and CPU status integration
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          ROOT="$(find staging_dir/target-* -maxdepth 1 -type d -name 'root-*' -print -quit)"
+          test -n "${ROOT}"
+
+          echo "===== zh-cn LuCI catalogs ====="
+          find "${ROOT}/usr/lib/lua/luci/i18n" -maxdepth 1 \
+            -type f -name '*.zh-cn.lmo' -printf '%f\n' | sort
+
+          test -n "$(find "${ROOT}/usr/lib/lua/luci/i18n" -maxdepth 1 \
+            -type f -name '*.zh-cn.lmo' -print -quit)"
+
+          echo "===== Chinese language registration ====="
+          grep -R "luci.languages.zh_cn" "${ROOT}/etc/uci-defaults" 2>/dev/null || true
+
+          echo "===== x86_pkg_temp restriction in built LuCI ====="
+          grep -R "x86_pkg_temp" \
+            "${ROOT}/www/luci-static/resources" 2>/dev/null
+
+          echo "===== CPU status integration ====="
+          grep -R "CPU 使用率" "${ROOT}/www/luci-static/resources/view/status/include/10_system.js"
+          grep -R "CPU 温度" "${ROOT}/www/luci-static/resources/view/status/include/10_system.js"
+
+      - name: Verify firmware output
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          test -d bin/targets/x86/64
+          find bin/targets/x86/64 -maxdepth 1 -type f -printf '%f\n' | sort
+
+          test -n "$(find bin/targets/x86/64 -maxdepth 1 -type f \( \
+            -name '*.img.gz' -o \
+            -name '*.vmdk' -o \
+            -name '*.vdi' -o \
+            -name '*.qcow2' \
+          \) -print -quit)"
+
+          # Verify DDNSTO integration
+          echo "===== DDNSTO firmware verification ====="
+          # Use same robust rootfs detection as the injection step
+          ROOTFS_VERIFY=""
+          ROOTFS_VERIFY="$(find staging_dir/target-* -maxdepth 1 -type d -name 'root-*' -print -quit 2>/dev/null)"
+          if [ -z "${ROOTFS_VERIFY}" ]; then
+            ROOTFS_VERIFY="$(find build_dir/target-* -maxdepth 1 -type d -name 'root-*' -print -quit 2>/dev/null)"
+          fi
+          if [ -z "${ROOTFS_VERIFY}" ]; then
+            ROOTFS_VERIFY="$(find . -name 'root-x86_64' -type d -print -quit 2>/dev/null)"
+          fi
+          if [ -z "${ROOTFS_VERIFY}" ]; then
+            ROOTFS_VERIFY="$(find . -name 'root-*' -type d -print -quit 2>/dev/null)"
+          fi
+          if [ -n "${ROOTFS_VERIFY}" ]; then
+            echo "Checking DDNSTO binary..."
+            test -f "${ROOTFS_VERIFY}/usr/bin/ddnsto"
+            test -x "${ROOTFS_VERIFY}/usr/bin/ddnsto"
+            echo "  Binary OK"
+
+            echo "Checking DDNSTO init script..."
+            test -f "${ROOTFS_VERIFY}/etc/init.d/ddnsto"
+            test -x "${ROOTFS_VERIFY}/etc/init.d/ddnsto"
+            echo "  Init script OK"
+
+            echo "Checking DDNSTO config..."
+            test -f "${ROOTFS_VERIFY}/etc/config/ddnsto"
+            echo "  Config OK"
+
+            echo "Checking RC symlinks..."
+            test -L "${ROOTFS_VERIFY}/etc/rc.d/S95ddnsto"
+            test -L "${ROOTFS_VERIFY}/etc/rc.d/K15ddnsto"
+            echo "  RC symlinks OK"
+
+            echo "Checking LuCI files..."
+            find "${ROOTFS_VERIFY}/usr/lib/lua/luci" -path '*ddnsto*' -type f 2>/dev/null | sort || echo "  Checking..."
+          fi
+          echo "DDNSTO verification complete"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt-25.12.5-x86_64-SonicFullcone-ImmortalCPUStatus-DDNSTO
+          path: openwrt/bin/targets/x86/64/*
+          if-no-files-found: error
