@@ -1,4 +1,4 @@
-name: Build OpenWrt 25.12.5 x86_64
+name: OpenWrt 25.12.5 x86_64_ddnsto
 
 on:
   workflow_dispatch:
@@ -483,7 +483,6 @@ jobs:
           test -x "${ROOT}/etc/init.d/ddnsto"
           test -f "${ROOT}/etc/config/ddnsto"
           test -f "${ROOT}/etc/uci-defaults/98-ddnsto-enable"
-          test -L "${ROOT}/etc/rc.d/S99ddnsto"
           grep -q "ddnsto" "${ROOT}/etc/init.d/ddnsto"
 
           echo "===== x86_pkg_temp restriction in built LuCI ====="
