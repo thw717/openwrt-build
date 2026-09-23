@@ -1,0 +1,531 @@
+name: deepseek OpenWrt 25.12.5 x86_64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_VERSION: v25.12.5
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gettext git \
+            libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync unzip zlib1g-dev file curl wget ca-certificates
+
+      - name: Clone OpenWrt 25.12.5
+        run: |
+          set -e
+          git clone --depth=1 --branch "${OPENWRT_VERSION}" \
+            https://github.com/openwrt/openwrt.git openwrt
+
+      - name: Update and install official feeds
+        working-directory: openwrt
+        run: |
+          set -e
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ========== 新增：添加 DDNSTO 官方源 ==========
+      - name: Add DDNSTO feed
+        working-directory: openwrt
+        run: |
+          set -e
+          echo 'src-git ddnsto https://github.com/linkease/ddnsto-openwrt' >> feeds.conf.default
+          ./scripts/feeds update ddnsto
+          ./scripts/feeds install -a -p ddnsto
+
+      - name: Apply SONiC Fullcone
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          curl -fsSL \
+            https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh \
+            -o /tmp/add_sonic_fullcone.sh
+          bash /tmp/add_sonic_fullcone.sh
+          rm -f /tmp/add_sonic_fullcone.sh
+
+      - name: Add ImmortalWrt-style CPU status to LuCI overview
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          STATUS_JS="feeds/luci/modules/luci-mod-status/htdocs/luci-static/resources/view/status/include/10_system.js"
+          STATUS_ACL="feeds/luci/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status-index.json"
+
+          test -f "${STATUS_JS}"
+          test -f "${STATUS_ACL}"
+
+          cat > "${STATUS_JS}" <<'EOF'
+          'use strict';
+
+          'require baseclass';
+          'require fs';
+          'require poll';
+          'require rpc';
+          'require uci';
+
+          var callLuciVersion = rpc.declare({
+              object: 'luci',
+              method: 'getVersion'
+          });
+
+          var callSystemBoard = rpc.declare({
+              object: 'system',
+              method: 'board'
+          });
+
+          var callSystemInfo = rpc.declare({
+              object: 'system',
+              method: 'info'
+          });
+
+          function parseCPUStat(text) {
+              if (typeof text != 'string')
+                  return null;
+
+              var line = text.split('\n').find(function(line) {
+                  return line.indexOf('cpu ') == 0;
+              });
+
+              if (!line)
+                  return null;
+
+              var values = line.trim().split(/\s+/).slice(1).map(Number);
+
+              if (values.length < 4 || values.some(isNaN))
+                  return null;
+
+              var idle = values[3] + (values[4] || 0);
+              var total = values.reduce(function(sum, value) {
+                  return sum + value;
+              }, 0);
+
+              return { idle: idle, total: total };
+          }
+
+          function getCPUUsage() {
+              return L.resolveDefault(fs.read('/proc/stat'), '').then(function(first) {
+                  return new Promise(function(resolve) {
+                      setTimeout(resolve, 250);
+                  }).then(function() {
+                      return L.resolveDefault(fs.read('/proc/stat'), '');
+                  }).then(function(second) {
+                      var a = parseCPUStat(first);
+                      var b = parseCPUStat(second);
+
+                      if (!a || !b)
+                          return null;
+
+                      var total = b.total - a.total;
+                      var idle = b.idle - a.idle;
+
+                      if (total <= 0)
+                          return null;
+
+                      return Math.max(0, Math.min(100,
+                          Math.round((1 - idle / total) * 100)));
+                  });
+              });
+          }
+
+          function getCPUPackageTemp() {
+              return L.resolveDefault(fs.list('/sys/class/thermal'), []).then(function(entries) {
+                  var zones = entries.filter(function(entry) {
+                      return entry && /^thermal_zone[0-9]+$/.test(entry.name);
+                  });
+
+                  return Promise.all(zones.map(function(zone) {
+                      var base = '/sys/class/thermal/' + zone.name;
+
+                      return L.resolveDefault(fs.read(base + '/type'), '').then(function(type) {
+                          if (type.trim() != 'x86_pkg_temp')
+                              return null;
+
+                          return L.resolveDefault(fs.read(base + '/temp'), '').then(function(temp) {
+                              var value = parseInt(String(temp).trim(), 10);
+
+                              if (!isFinite(value))
+                                  return null;
+
+                              return (value / 1000).toFixed(1).replace(/\.0$/, '') + '°C';
+                          });
+                      });
+                  })).then(function(values) {
+                      return values.find(function(value) {
+                          return value !== null;
+                      }) || null;
+                  });
+              });
+          }
+
+          function getMetrics() {
+              return Promise.all([
+                  L.resolveDefault(getCPUUsage(), null),
+                  L.resolveDefault(getCPUPackageTemp(), null)
+              ]).then(function(values) {
+                  return {
+                      cpu: values[0],
+                      temp: values[1]
+                  };
+              });
+          }
+
+          return baseclass.extend({
+              title: _('System'),
+
+              load: function() {
+                  return Promise.all([
+                      L.resolveDefault(callSystemBoard(), {}),
+                      L.resolveDefault(callSystemInfo(), {}),
+                      L.resolveDefault(callLuciVersion(), {
+                          revision: _('unknown version'),
+                          branch: 'LuCI'
+                      }),
+                      uci.load('system'),
+                      L.resolveDefault(getMetrics(), { cpu: null, temp: null })
+                  ]);
+              },
+
+              render: function(data) {
+                  var boardinfo = data[0],
+                      systeminfo = data[1],
+                      luciversion = data[2],
+                      metrics = data[4];
+
+                  luciversion = luciversion.branch + ' ' + luciversion.revision;
+
+                  var datestr = null;
+                  var unixtime = Math.floor(Date.now() / 1000);
+
+                  if (unixtime) {
+                      var date = new Date(unixtime * 1000),
+                          zn = uci.get('system', '@system[0]', 'zonename')?.replaceAll(' ', '_') || 'UTC',
+                          ts = uci.get('system', '@system[0]', 'clock_timestyle') || 0,
+                          hc = uci.get('system', '@system[0]', 'clock_hourcycle') || 0;
+
+                      datestr = new Intl.DateTimeFormat(undefined, {
+                          dateStyle: 'medium',
+                          timeStyle: (ts == 0) ? 'long' : 'full',
+                          hourCycle: (hc == 0) ? undefined : hc,
+                          timeZone: zn
+                      }).format(date);
+                  }
+
+                  var fields = [
+                      _('Hostname'), boardinfo.hostname,
+                      _('Model'), boardinfo.model,
+                      _('Architecture'), boardinfo.system,
+                      _('Target Platform'), (L.isObject(boardinfo.release) ? boardinfo.release.target : ''),
+                      _('Firmware Version'), (L.isObject(boardinfo.release) ? boardinfo.release.description + ' / ' : '') + (luciversion || ''),
+                      _('Kernel Version'), boardinfo.kernel,
+                      _('Local Time'), datestr,
+                      _('Uptime'), systeminfo.uptime ? '%t'.format(systeminfo.uptime) : null,
+                      _('Load Average'), Array.isArray(systeminfo.load) ? '%.2f, %.2f, %.2f'.format(
+                          systeminfo.load[0] / 65535.0,
+                          systeminfo.load[1] / 65535.0,
+                          systeminfo.load[2] / 65535.0
+                      ) : null,
+                      'CPU 使用率', metrics.cpu != null ? metrics.cpu + '%' : '?',
+                      'CPU 温度', metrics.temp != null ? metrics.temp : '?'
+                  ];
+
+                  var table = E('table', { 'class': 'table' });
+                  var cpuCell, tempCell;
+
+                  for (var i = 0; i < fields.length; i += 2) {
+                      var value = (fields[i + 1] != null) ? fields[i + 1] : '?';
+                      var cell = E('td', {
+                          'class': 'td left'
+                      }, [ value ]);
+
+                      var row = E('tr', { 'class': 'tr' }, [
+                          E('td', {
+                              'class': 'td left',
+                              'width': '33%'
+                          }, [ fields[i] ]),
+                          cell
+                      ]);
+
+                      table.appendChild(row);
+
+                      if (fields[i] == 'CPU 使用率')
+                          cpuCell = cell;
+                      else if (fields[i] == 'CPU 温度')
+                          tempCell = cell;
+                  }
+
+                  var lastCPU = metrics.cpu;
+                  var lastTemp = metrics.temp;
+
+                  poll.add(function() {
+                      return getMetrics().then(function(next) {
+                          // Keep the last known good value if one sample fails.
+                          if (next.cpu != null) {
+                              lastCPU = next.cpu;
+                              if (cpuCell)
+                                  cpuCell.textContent = lastCPU + '%';
+                          }
+
+                          if (next.temp != null) {
+                              lastTemp = next.temp;
+                              if (tempCell)
+                                  tempCell.textContent = lastTemp;
+                          }
+                      });
+                  }, 1);
+
+                  return table;
+              }
+          });
+          EOF
+
+          python3 - "${STATUS_ACL}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          data = json.loads(path.read_text(encoding="utf-8"))
+
+          group = data.setdefault("luci-mod-status-index", {})
+          read = group.setdefault("read", {})
+          files = read.setdefault("file", {})
+
+          files["/proc/stat"] = ["read"]
+          files["/sys/class/thermal"] = ["list"]
+          files["/sys/class/thermal/thermal_zone*"] = ["list"]
+          files["/sys/class/thermal/thermal_zone*/type"] = ["read"]
+          files["/sys/class/thermal/thermal_zone*/temp"] = ["read"]
+
+          path.write_text(
+              json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8"
+          )
+          PY
+
+          node --check "${STATUS_JS}"
+          python3 -m json.tool "${STATUS_ACL}" >/dev/null
+
+          grep -n -E "getCPUUsage|getCPUPackageTemp|x86_pkg_temp|CPU usage" "${STATUS_JS}"
+          grep -n -E "/proc/stat|thermal_zone.*/type|thermal_zone.*/temp" "${STATUS_ACL}"
+
+      - name: Force LuCI Simplified Chinese language
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-luci-zh-cn <<'EOF'
+          #!/bin/sh
+          uci -q set luci.main.lang='zh_cn'
+          uci -q commit luci
+          exit 0
+          EOF
+          chmod 0755 files/etc/uci-defaults/99-luci-zh-cn
+
+      # ========== 新增：确保 DDNSTO 的 uci-defaults 和 init 脚本正确就位 ==========
+      - name: Ensure DDNSTO init and uci-defaults
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          # 如果源码 feed 已自带 uci-defaults，则保留；否则补建一个健壮的初始化脚本
+          if [ ! -f files/etc/uci-defaults/50_luci-ddnsto ]; then
+            mkdir -p files/etc/uci-defaults
+            cat > files/etc/uci-defaults/50_luci-ddnsto <<'EOF'
+#!/bin/sh
+# 确保 DDNSTO 的 UCI 配置文件存在且结构正确
+[ -f /etc/config/ddnsto ] || touch /etc/config/ddnsto
+
+# 如果 section 不存在则创建，已存在则保留用户配置
+if ! uci -q get ddnsto.@ddnsto[0] >/dev/null 2>&1; then
+    uci -q batch <<EOI
+set ddnsto.@ddnsto[0]=ddnsto
+set ddnsto.@ddnsto[0].enabled='0'
+set ddnsto.@ddnsto[0].token=''
+commit ddnsto
+EOI
+fi
+exit 0
+EOF
+            chmod 0755 files/etc/uci-defaults/50_luci-ddnsto
+          fi
+
+          # 修正 init 脚本的 boot 函数（某些版本 boot 段只有 return，导致开机不启动）
+          if [ -f files/etc/init.d/ddnsto ]; then
+            if grep -q '^boot()' files/etc/init.d/ddnsto 2>/dev/null; then
+              # 在 boot() 函数体内插入 start，如果尚未包含
+              if ! sed -n '/^boot()/,/^}/p' files/etc/init.d/ddnsto | grep -q 'start'; then
+                sed -i '/^boot() {/a\    start' files/etc/init.d/ddnsto
+              fi
+            fi
+          fi
+
+      - name: Configure OpenWrt 25.12
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-base=y
+          CONFIG_PACKAGE_luci-mod-status=y
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+
+          CONFIG_LUCI_LANG_zh_Hans=y
+
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=y
+
+          CONFIG_PACKAGE_luci-app-ttyd=y
+
+          CONFIG_PACKAGE_miniupnpd-nftables=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+          CONFIG_PACKAGE_ddns-scripts-dnspod=y
+
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-certificates=y
+
+          CONFIG_PACKAGE_luci-app-uhttpd=y
+
+          CONFIG_PACKAGE_luci-app-statistics=y
+          CONFIG_PACKAGE_collectd-mod-thermal=y
+
+          CONFIG_PACKAGE_kmod-thermal=y
+          CONFIG_PACKAGE_kmod-hwmon-core=y
+
+          # ========== DDNSTO 集成（三项必须同时启用） ==========
+          CONFIG_PACKAGE_ddnsto=y
+          CONFIG_PACKAGE_luci-app-ddnsto=y
+          CONFIG_PACKAGE_luci-i18n-ddnsto-zh-cn=y
+
+          EOF
+
+          make defconfig
+
+      - name: Verify configuration
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          grep -q '^CONFIG_LUCI_LANG_zh_Hans=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-base-zh-cn=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y$' .config
+
+          # DDNSTO 三项校验
+          grep -q '^CONFIG_PACKAGE_ddnsto=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-app-ddnsto=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-i18n-ddnsto-zh-cn=y$' .config
+
+          test ! -d package/custom/luci-app-cpu-widget
+
+      - name: Download sources
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          make download -j"$(nproc)"
+
+      - name: Build firmware
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          make -j"$(nproc)"
+
+      - name: Verify Chinese catalogs and CPU status integration
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          ROOT="$(find staging_dir/target-* -maxdepth 1 -type d -name 'root-*' -print -quit)"
+          test -n "${ROOT}"
+
+          echo "===== zh-cn LuCI catalogs ====="
+          find "${ROOT}/usr/lib/lua/luci/i18n" -maxdepth 1 \
+            -type f -name '*.zh-cn.lmo' -printf '%f\n' | sort
+
+          test -n "$(find "${ROOT}/usr/lib/lua/luci/i18n" -maxdepth 1 \
+            -type f -name '*.zh-cn.lmo' -print -quit)"
+
+          echo "===== Chinese language registration ====="
+          grep -R "luci.languages.zh_cn" "${ROOT}/etc/uci-defaults" 2>/dev/null || true
+
+          echo "===== x86_pkg_temp restriction in built LuCI ====="
+          grep -R "x86_pkg_temp" \
+            "${ROOT}/www/luci-static/resources" 2>/dev/null
+
+          echo "===== CPU status integration ====="
+          grep -R "CPU 使用率" "${ROOT}/www/luci-static/resources/view/status/include/10_system.js"
+          grep -R "CPU 温度" "${ROOT}/www/luci-static/resources/view/status/include/10_system.js"
+
+          # ========== 新增：验证 DDNSTO 关键组件已打入固件 ==========
+          echo "===== DDNSTO binary ====="
+          test -x "${ROOT}/usr/sbin/ddnsto" || test -x "${ROOT}/usr/bin/ddnsto" || {
+            echo "ERROR: ddnsto binary not found in firmware rootfs"; exit 1; }
+
+          echo "===== DDNSTO init script ====="
+          test -f "${ROOT}/etc/init.d/ddnsto" || {
+            echo "ERROR: /etc/init.d/ddnsto missing"; exit 1; }
+
+          echo "===== DDNSTO uci-defaults ====="
+          test -f "${ROOT}/etc/uci-defaults/50_luci-ddnsto" || {
+            echo "ERROR: /etc/uci-defaults/50_luci-ddnsto missing"; exit 1; }
+
+          echo "DDNSTO integration verification passed."
+
+      - name: Verify firmware output
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+          test -d bin/targets/x86/64
+          find bin/targets/x86/64 -maxdepth 1 -type f -printf '%f\n' | sort
+
+          test -n "$(find bin/targets/x86/64 -maxdepth 1 -type f \( \
+            -name '*.img.gz' -o \
+            -name '*.vmdk' -o \
+            -name '*.vdi' -o \
+            -name '*.qcow2' \
+          \) -print -quit)"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt-25.12.5-x86_64-SonicFullcone-ImmortalCPUStatus-DDNSTO
+          path: openwrt/bin/targets/x86/64/*
+          if-no-files-found: error
