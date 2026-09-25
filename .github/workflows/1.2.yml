@@ -15,7 +15,6 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -28,7 +27,7 @@ jobs:
         run: |
           git clone --depth=1 -b ${OPENWRT_BRANCH} https://github.com/immortalwrt/immortalwrt.git openwrt
 
-      - name: Add OpenClash with retry
+      - name: Add OpenClash
         run: |
           cd openwrt/package
           for i in 1 2 3; do
@@ -38,7 +37,7 @@ jobs:
           mv OpenClash/luci-app-openclash luci-app-openclash
           rm -rf OpenClash
 
-      - name: Add SSR Plus with retry
+      - name: Add SSR Plus
         run: |
           cd openwrt/package
           for i in 1 2 3; do
@@ -46,33 +45,22 @@ jobs:
             sleep 10
           done
 
-      - name: Embed latest Mihomo compatible core
+      - name: Embed Mihomo Core
         run: |
           cd openwrt
           mkdir -p package/luci-app-openclash/root/etc/openclash/core
 
           for i in 1 2 3; do
-            CORE_URL=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
-              | grep browser_download_url \
-              | grep linux-amd64-compatible \
-              | grep '.gz' \
-              | cut -d '"' -f4 \
-              | head -n1)
-
+            CORE_URL=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep browser_download_url | grep linux-amd64-compatible | grep '.gz' | cut -d '"' -f4 | head -n1)
             if [ -n "${CORE_URL}" ]; then
-              wget -O /tmp/clash_meta.gz "${CORE_URL}" && break
+              wget "${CORE_URL}" -O /tmp/clash_meta.gz && break
             fi
-
             sleep 10
           done
 
           gzip -d /tmp/clash_meta.gz
-
-          mv /tmp/clash_meta \
-            package/luci-app-openclash/root/etc/openclash/core/clash_meta
-
-          chmod 755 \
-            package/luci-app-openclash/root/etc/openclash/core/clash_meta
+          mv /tmp/clash_meta package/luci-app-openclash/root/etc/openclash/core/clash_meta
+          chmod 755 package/luci-app-openclash/root/etc/openclash/core/clash_meta
 
       - name: Update feeds
         run: |
@@ -85,38 +73,38 @@ jobs:
           cd openwrt
 
           cat > .config <<'EOF'
-CONFIG_TARGET_x86=y
-CONFIG_TARGET_x86_64=y
-CONFIG_TARGET_x86_64_DEVICE_generic=y
-CONFIG_TARGET_IMAGES_GZIP=y
-CONFIG_TARGET_ROOTFS_SQUASHFS=y
-CONFIG_TARGET_ROOTFS_EXT4FS=y
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          CONFIG_TARGET_IMAGES_GZIP=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          CONFIG_TARGET_ROOTFS_EXT4FS=y
 
-CONFIG_PACKAGE_luci=y
-CONFIG_PACKAGE_luci-theme-bootstrap=y
-CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
 
-CONFIG_PACKAGE_luci-app-openclash=y
-CONFIG_PACKAGE_luci-app-ssr-plus=y
+          CONFIG_PACKAGE_luci-app-openclash=y
+          CONFIG_PACKAGE_luci-app-ssr-plus=y
 
-CONFIG_PACKAGE_xray-core=y
-CONFIG_PACKAGE_v2ray-core=y
-CONFIG_PACKAGE_trojan=y
+          CONFIG_PACKAGE_xray-core=y
+          CONFIG_PACKAGE_v2ray-core=y
+          CONFIG_PACKAGE_trojan=y
 
-CONFIG_PACKAGE_kmod-tun=y
-CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
 
-CONFIG_PACKAGE_kmod-e1000=y
-CONFIG_PACKAGE_kmod-e1000e=y
-CONFIG_PACKAGE_kmod-igb=y
-CONFIG_PACKAGE_kmod-r8169=y
-CONFIG_PACKAGE_kmod-tg3=y
-CONFIG_PACKAGE_kmod-virtio-net=y
-CONFIG_PACKAGE_kmod-vmxnet3=y
+          CONFIG_PACKAGE_kmod-e1000=y
+          CONFIG_PACKAGE_kmod-e1000e=y
+          CONFIG_PACKAGE_kmod-igb=y
+          CONFIG_PACKAGE_kmod-r8169=y
+          CONFIG_PACKAGE_kmod-tg3=y
+          CONFIG_PACKAGE_kmod-virtio-net=y
+          CONFIG_PACKAGE_kmod-vmxnet3=y
 
-CONFIG_PACKAGE_kmod-crypto-aesni=y
-CONFIG_PACKAGE_libopenssl=y
-EOF
+          CONFIG_PACKAGE_kmod-crypto-aesni=y
+          CONFIG_PACKAGE_libopenssl=y
+          EOF
 
           make defconfig
 
@@ -126,12 +114,15 @@ EOF
           mkdir -p files/etc/uci-defaults
 
           cat > files/etc/uci-defaults/99-default-lan-ip <<'EOF'
-#!/bin/sh
-uci set network.lan.ipaddr='192.168.1.2'
-uci set network.lan.netmask='255.255.255.0'
-uci commit network
-exit 0
-EOF
+          #!/bin/sh
+          uci set network.lan.ipaddr='192.168.1.2'
+          uci set network.lan.netmask='255.255.255.0'
+          uci set dhcp.lan.start='100'
+          uci set dhcp.lan.limit='151'
+          uci commit network
+          uci commit dhcp
+          exit 0
+          EOF
 
           chmod 755 files/etc/uci-defaults/99-default-lan-ip
 
