@@ -1,457 +1,149 @@
 name: Build ImmortalWrt 25.12 x86_64 OpenClash SSRPlus
 
-
 on:
   workflow_dispatch:
 
-
 permissions:
   contents: read
-
 
 env:
   TZ: Asia/Shanghai
   OPENWRT_BRANCH: openwrt-25.12
 
-
 jobs:
-
   build:
-
-    name: ImmortalWrt 25.12 x86_64 Build
-
     runs-on: ubuntu-24.04
-
 
     steps:
 
-
-    - name: Checkout
-
-      uses: actions/checkout@v4
-
-
-
-    - name: Install build dependencies
-
-      run: |
-
-        sudo apt update
-
-        sudo apt install -y \
-          build-essential \
-          clang \
-          flex \
-          bison \
-          gawk \
-          gcc-multilib \
-          gettext \
-          git \
-          libncurses-dev \
-          libssl-dev \
-          python3 \
-          rsync \
-          unzip \
-          wget \
-          curl \
-          zstd \
-          ccache
-
-
-
-    #################################################
-    # Clone ImmortalWrt
-    #################################################
-
-    - name: Clone ImmortalWrt 25.12
-
-      run: |
-
-        git clone \
-          --depth=1 \
-          -b ${OPENWRT_BRANCH} \
-          https://github.com/immortalwrt/immortalwrt.git \
-          openwrt
-
-
-
-    #################################################
-    # OpenClash latest
-    #################################################
-
-    - name: Add OpenClash
-
-      run: |
-
-        cd openwrt/package
-
-
-        git clone \
-          --depth=1 \
-          https://github.com/vernesong/OpenClash.git \
-          luci-app-openclash
-
-
-
-    #################################################
-    # SSR Plus latest
-    #################################################
-
-    - name: Add SSR Plus
-
-      run: |
-
-        cd openwrt/package
-
-
-        git clone \
-          --depth=1 \
-          https://github.com/fw876/helloworld.git \
-          helloworld
-
-
-
-    #################################################
-    # Mihomo latest compatible core
-    #################################################
-
-    - name: Embed Mihomo Core
-
-      run: |
-
-        cd openwrt
-
-
-        mkdir -p \
-        package/luci-app-openclash/luci-app-openclash/root/etc/openclash/core
-
-
-
-        CORE_URL=$(curl -s \
-        https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
-        | grep browser_download_url \
-        | grep linux-amd64-compatible \
-        | grep ".gz" \
-        | cut -d '"' -f4 \
-        | head -n1)
-
-
-
-        echo "Mihomo URL:"
-        echo ${CORE_URL}
-
-
-
-        wget \
-        "${CORE_URL}" \
-        -O /tmp/clash_meta.gz
-
-
-
-        gzip -d /tmp/clash_meta.gz
-
-
-
-        mv \
-        /tmp/clash_meta \
-        package/luci-app-openclash/luci-app-openclash/root/etc/openclash/core/clash_meta
-
-
-
-        chmod 755 \
-        package/luci-app-openclash/luci-app-openclash/root/etc/openclash/core/clash_meta
-
-
-
-
-    #################################################
-    # Feeds
-    #################################################
-
-    - name: Update feeds
-
-      run: |
-
-        cd openwrt
-
-
-        ./scripts/feeds update -a
-
-
-        ./scripts/feeds install -a
-
-
-
-
-    #################################################
-    # Config
-    #################################################
-
-    - name: Generate config
-
-      run: |
-
-        cd openwrt
-
-
-        cat > .config <<'EOF'
-
-
-#
-# Target x86_64
-#
-
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential clang flex bison gawk gettext gcc-multilib git libncurses-dev libssl-dev python3 rsync unzip wget curl zstd ccache
+
+      - name: Clone ImmortalWrt
+        run: |
+          git clone --depth=1 -b ${OPENWRT_BRANCH} https://github.com/immortalwrt/immortalwrt.git openwrt
+
+      - name: Add OpenClash with retry
+        run: |
+          cd openwrt/package
+          for i in 1 2 3; do
+            git clone --depth=1 https://github.com/vernesong/OpenClash.git OpenClash && break || rm -rf OpenClash
+            sleep 10
+          done
+          mv OpenClash/luci-app-openclash luci-app-openclash
+          rm -rf OpenClash
+
+      - name: Add SSR Plus with retry
+        run: |
+          cd openwrt/package
+          for i in 1 2 3; do
+            git clone --depth=1 https://github.com/fw876/helloworld.git helloworld && break || rm -rf helloworld
+            sleep 10
+          done
+
+      - name: Embed latest Mihomo compatible core
+        run: |
+          cd openwrt
+          mkdir -p package/luci-app-openclash/root/etc/openclash/core
+
+          for i in 1 2 3; do
+            CORE_URL=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+              | grep browser_download_url \
+              | grep linux-amd64-compatible \
+              | grep '.gz' \
+              | cut -d '"' -f4 \
+              | head -n1)
+
+            if [ -n "${CORE_URL}" ]; then
+              wget -O /tmp/clash_meta.gz "${CORE_URL}" && break
+            fi
+
+            sleep 10
+          done
+
+          gzip -d /tmp/clash_meta.gz
+
+          mv /tmp/clash_meta \
+            package/luci-app-openclash/root/etc/openclash/core/clash_meta
+
+          chmod 755 \
+            package/luci-app-openclash/root/etc/openclash/core/clash_meta
+
+      - name: Update feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Generate config
+        run: |
+          cd openwrt
+
+          cat > .config <<'EOF'
 CONFIG_TARGET_x86=y
-
 CONFIG_TARGET_x86_64=y
-
 CONFIG_TARGET_x86_64_DEVICE_generic=y
-
-
-
-#
-# Images
-#
-
 CONFIG_TARGET_IMAGES_GZIP=y
-
 CONFIG_TARGET_ROOTFS_SQUASHFS=y
-
 CONFIG_TARGET_ROOTFS_EXT4FS=y
 
-
-
-#
-# LuCI
-#
-
 CONFIG_PACKAGE_luci=y
-
-CONFIG_PACKAGE_luci-base=y
-
-
-# Default OpenWrt theme
-
 CONFIG_PACKAGE_luci-theme-bootstrap=y
-
-
-
-#
-# Chinese language
-# ImmortalWrt 25.12 apk/LuCI mechanism
-#
-
 CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
 
-CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
-
-CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=y
-
-
-
-#
-# OpenClash
-#
-
 CONFIG_PACKAGE_luci-app-openclash=y
-
-
-CONFIG_PACKAGE_bash=y
-
-CONFIG_PACKAGE_curl=y
-
-CONFIG_PACKAGE_ca-bundle=y
-
-CONFIG_PACKAGE_dnsmasq-full=y
-
-CONFIG_PACKAGE_ip-full=y
-
-CONFIG_PACKAGE_ruby=y
-
-CONFIG_PACKAGE_ruby-yaml=y
-
-
-CONFIG_PACKAGE_kmod-tun=y
-
-CONFIG_PACKAGE_kmod-inet-diag=y
-
-CONFIG_PACKAGE_kmod-nft-tproxy=y
-
-
-
-#
-# SSR Plus+
-#
-
 CONFIG_PACKAGE_luci-app-ssr-plus=y
 
-
 CONFIG_PACKAGE_xray-core=y
-
 CONFIG_PACKAGE_v2ray-core=y
-
 CONFIG_PACKAGE_trojan=y
 
-
-CONFIG_PACKAGE_shadowsocks-libev-ss-local=y
-
-CONFIG_PACKAGE_shadowsocksr-libev-ssr-local=y
-
-
-
-#
-# Crypto
-#
-
-CONFIG_PACKAGE_kmod-crypto-aesni=y
-
-CONFIG_PACKAGE_libopenssl=y
-
-
-
-#
-# Network drivers
-#
-# Intel 82579LM
-# Intel 82574L
-#
+CONFIG_PACKAGE_kmod-tun=y
+CONFIG_PACKAGE_kmod-nft-tproxy=y
 
 CONFIG_PACKAGE_kmod-e1000=y
-
 CONFIG_PACKAGE_kmod-e1000e=y
-
-
-
-# Common Intel
-
 CONFIG_PACKAGE_kmod-igb=y
-
-
-
-# Backup NIC
-
 CONFIG_PACKAGE_kmod-r8169=y
-
 CONFIG_PACKAGE_kmod-tg3=y
-
-
-
-# Virtualization
-
 CONFIG_PACKAGE_kmod-virtio-net=y
-
 CONFIG_PACKAGE_kmod-vmxnet3=y
 
-
-
-#
-# Tools
-#
-
-CONFIG_PACKAGE_htop=y
-
-CONFIG_PACKAGE_nano=y
-
-CONFIG_PACKAGE_wget-ssl=y
-
-
+CONFIG_PACKAGE_kmod-crypto-aesni=y
+CONFIG_PACKAGE_libopenssl=y
 EOF
 
+          make defconfig
 
-        make defconfig
+      - name: Set default LAN IP
+        run: |
+          cd openwrt
+          mkdir -p files/etc/uci-defaults
 
-
-
-
-    #################################################
-    # Default LAN IP
-    #################################################
-
-    - name: Set default LAN IP 192.168.1.2
-
-      run: |
-
-        cd openwrt
-
-
-        mkdir -p files/etc/uci-defaults
-
-
-        cat > files/etc/uci-defaults/99-default-lan-ip <<'EOF'
+          cat > files/etc/uci-defaults/99-default-lan-ip <<'EOF'
 #!/bin/sh
-
-
 uci set network.lan.ipaddr='192.168.1.2'
-
 uci set network.lan.netmask='255.255.255.0'
-
-
-uci set dhcp.lan.start='100'
-
-uci set dhcp.lan.limit='151'
-
-uci set dhcp.lan.leasetime='12h'
-
-
 uci commit network
-
-uci commit dhcp
-
-
 exit 0
 EOF
 
+          chmod 755 files/etc/uci-defaults/99-default-lan-ip
 
-        chmod 755 files/etc/uci-defaults/99-default-lan-ip
+      - name: Compile firmware
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+          make -j$(nproc) V=s
 
-
-
-
-    #################################################
-    # Download
-    #################################################
-
-    - name: Download packages
-
-      run: |
-
-        cd openwrt
-
-        make download -j$(nproc)
-
-
-
-    #################################################
-    # Compile
-    #################################################
-
-    - name: Compile firmware
-
-      run: |
-
-        cd openwrt
-
-
-        make -j$(nproc) V=s
-
-
-
-
-    #################################################
-    # Upload
-    #################################################
-
-    - name: Upload firmware
-
-      uses: actions/upload-artifact@v4
-
-
-      with:
-
-        name: ImmortalWrt-25.12-x86_64-E3-1265L-v2
-
-        compression-level: 9
-
-        path: |
-
-          openwrt/bin/targets/x86/64/*
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt-25.12-x86_64-E3-1265L-v2-OpenClash-SSRPlus
+          compression-level: 9
+          path: openwrt/bin/targets/x86/64/*
