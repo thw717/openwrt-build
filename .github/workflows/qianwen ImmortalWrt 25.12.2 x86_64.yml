@@ -1,4 +1,4 @@
-name: qianwen ImmortalWrt 25.12.2 x86_64
+name: Build ImmortalWrt 25.12.2 x86_64
 
 on:
   workflow_dispatch:
@@ -21,38 +21,57 @@ concurrency:
 
 env:
   TZ: Asia/Shanghai
+  DEBIAN_FRONTEND: noninteractive
 
 jobs:
   build:
     name: Build x86_64
     runs-on: ubuntu-24.04
-
+    permissions:
+      contents: write
     steps:
     - name: Checkout
       uses: actions/checkout@v5
 
-    - name: Free Disk Space
-      uses: jlumbroso/free-disk-space@v1.3.1
-      with:
-        tool-cache: false
-        android: true
-        dotnet: true
-        haskell: true
-        large-packages: true
-        docker-images: true
-        swap-storage: true
+    - name: Free Disk Space (safe)
+      run: |
+        # 安全清理：不删除 /etc/apt/sources.list.d/* 中的系统源
+        sudo swapoff -a 2>/dev/null || true
+        sudo rm -f /swapfile 2>/dev/null || true
+        sudo rm -rf /usr/share/dotnet 2>/dev/null || true
+        sudo rm -rf /usr/local/lib/android 2>/dev/null || true
+        sudo rm -rf /opt/ghc 2>/dev/null || true
+        sudo rm -rf /usr/local/.ghcup 2>/dev/null || true
+        sudo rm -rf ~/.cache/pip 2>/dev/null || true
+        sudo rm -rf ~/.npm 2>/dev/null || true
+        sudo apt-get clean
+        sudo rm -rf /tmp/* 2>/dev/null || true
+        echo "Free space:"
+        df -h
+        echo "Swap:"
+        free -h
 
     - name: Install Dependencies
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+        # 先更新包索引（不删除任何sources）
         sudo apt-get update
-        sudo apt-get install -y build-essential clang flex bison g++ gawk \\
-          gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \\
-          python3-setuptools rsync unzip zlib1g-dev file wget \\
-          libpython3-dev python3-pip jq ccache \\
-          llvm clang cmake help2man libelf-dev libdw-dev
+        # 安装编译依赖（Ubuntu 24.04 兼容）
+        sudo apt-get install -y --no-install-recommends \
+          build-essential clang flex bison g++ gawk \
+          gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+          python3-setuptools rsync unzip zlib1g-dev file wget \
+          libpython3-dev python3-pip jq ccache \
+          llvm clang cmake help2man libelf-dev libdw-dev \
+          diffutils pkg-config libnftnl-dev libmnl-dev libpcre2-dev \
+          libxml2-dev libjson-c-dev libubox-dev libustream-wolfssl-dev \
+          liblua5.3-dev libpcre3-dev libcap-dev libselinux-dev \
+          libgmp-dev libmpfr-dev libmpc-dev libcrypt-dev \
+          libffi-dev liblzma-dev libzstd-dev libbzip2-dev \
+          libreadline-dev libsqlite3-dev libncursesw5-dev \
+          xz-utils tk uuid-dev wget curl
         pip3 install --upgrade pip
         pip3 install pyelftools
+        # 创建 swapfile
         sudo fallocate -l 8G /swapfile
         sudo chmod 600 /swapfile
         sudo mkswap /swapfile
@@ -61,22 +80,40 @@ jobs:
         df -h
         echo "Swap:"
         free -h
+        echo "GCC version:"
+        gcc --version | head -1
+        echo "Make version:"
+        make --version | head -1
 
     - name: Clone ImmortalWrt Source
       run: |
+        set -e
+        rm -rf openwrt 2>/dev/null || true
         git clone https://github.com/immortalwrt/immortalwrt.git openwrt
         cd openwrt
+        echo "=== Available tags ==="
+        git tag | sort -V | tail -10
+        echo "=== Checking for v25.12.2 ==="
         if git tag | grep -q "v25.12.2"; then
           git checkout v25.12.2
           echo "Checked out v25.12.2 tag"
+        elif git tag | grep -q "25.12.2"; then
+          git checkout 25.12.2
+          echo "Checked out 25.12.2 tag"
         elif git branch --all | grep -q "origin/openwrt-25.12"; then
           git checkout openwrt-25.12
           echo "Checked out openwrt-25.12 branch"
-        else
-          echo "Warning: v25.12.2 tag not found, using master branch"
+        elif git branch --all | grep -q "origin/master"; then
           git checkout master
+          echo "Checked out master branch (v25.12.2 tag not found)"
+        else
+          git checkout main
+          echo "Checked out main branch (fallback)"
         fi
+        echo "Current commit:"
         git log --oneline -1
+        echo "Branch/Tag:"
+        git describe --tags 2>/dev/null || git rev-parse --abbrev-ref HEAD
 
     - name: Update Feeds
       run: |
@@ -85,63 +122,75 @@ jobs:
         ./scripts/feeds install -a
 
     - name: Download DDNSTO Binary
+      id: ddnsto_内部工具
       run: |
         cd openwrt
         mkdir -p dl
-        wget -q -O dl/ddnsto "https://fw.koolcenter.com/binary/ddnsto/openwrt/x86_64/ddnsto" 2>&1 || true
-        if [ -f dl/ddnsto ] && [ -s dl/ddnsto ]; then
-          chmod +x dl/ddnsto
-          echo "DDNSTO binary downloaded successfully"
-          file dl/ddnsto
+        echo "=== Downloading DDNSTO binary ==="
+        # 尝试下载 x86_64 版本的 DDNSTO
+        if wget -q -O dl/ddnsto-x86_64 "https://fw.koolcenter.com/binary/ddnsto/openwrt/x86_64/ddnsto" 2>&1; then
+          if [ -f dl/ddnsto-x86_64 ] && [ -s dl/ddnsto-x86_64 ]; then
+            chmod +x dl/ddnsto-x86_64
+            echo "DDNSTO x86_64 binary 内部工具ed successfully"
+            file dl/ddnsto-x86_64
+            echo "ddnsto_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "DDNSTO binary 内部工具ed but is empty, removing"
+            rm -f dl/ddnsto-x86_64
+            echo "ddnsto_available=false" >> $GITHUB_OUTPUT
+          fi
         else
-          echo "DDNSTO binary download failed, will embed later"
-          rm -f dl/ddnsto
+          echo "DDNSTO binary 内部工具 failed"
+          rm -f dl/ddnsto-x86_64 2>/dev/null || true
+          echo "ddnsto_available=false" >> $GITHUB_OUTPUT
         fi
 
-    - name: Apply Configurations and Create Build Config
+    - name: Apply Configurations
       run: |
         cd openwrt
-
         # === 1. 修改默认IP为192.168.50.2 ===
-        sed -i 's/192.168.1.1/192.168.50.2/g' package/base-files/files/bin/config_generate
-
+        sed -i 's/192.168.1.1/192.168.50.2/g' package/base-files/files/bin/config_generate 2>/dev/null || true
         # === 2. 修改主机名 ===
-        sed -i 's/OpenWrt/ImmortalWrt/g' package/base-files/files/bin/config_generate
-
+        sed -i 's/OpenWrt/ImmortalWrt/g' package/base-files/files/bin/config_generate 2>/dev/null || true
+        sed -i 's/LEDE/ImmortalWrt/g' package/base-files/files/bin/config_generate 2>/dev/null || true
         # === 3. 关闭LAN口DHCP服务器 ===
-        # 在config_generate中设置DHCP为ignore
         if grep -q "setup_lan" package/base-files/files/bin/config_generate; then
           sed -i "/function setup_lan/,/^}/ { s/uci set dhcp.lan.ignore=.*/uci set dhcp.lan.ignore=1/ }" package/base-files/files/bin/config_generate 2>/dev/null || true
         fi
-
         # === 4. 设置默认语言为简体中文 ===
         LUCI_CONFIG_PATH="feeds/luci/modules/luci-base/root/etc/config/luci"
         if [ -f "$LUCI_CONFIG_PATH" ]; then
           sed -i "s/option lang .*/option lang 'zh_cn'/" "$LUCI_CONFIG_PATH"
           echo "Set language to zh_cn"
         fi
-
         # === 5. 设置默认主题为bootstrap ===
         if [ -f "$LUCI_CONFIG_PATH" ]; then
           sed -i '/option mediaurlbase/d' "$LUCI_CONFIG_PATH"
-          sed -i "/config core 'main'/a option mediaurlbase '/luci-static/bootstrap'" "$LUCI_CONFIG_PATH"
+          if grep -q "config core 'main'" "$LUCI_CONFIG_PATH"; then
+            sed -i "/config core 'main'/a \toption mediaurlbase '/luci-static/bootstrap'" "$LUCI_CONFIG_PATH"
+          else
+            echo "" >> "$LUCI_CONFIG_PATH"
+            echo "config core 'main'" >> "$LUCI_CONFIG_PATH"
+            echo -e "\toption mediaurlbase '/luci-static/bootstrap'" >> "$LUCI_CONFIG_PATH"
+          fi
           echo "Set theme to bootstrap"
         fi
+        echo "Configuration applied successfully"
 
-        # === 6. 创建编译配置文件 ===
+    - name: Create Build Config
+      run: |
+        cd openwrt
+        # 创建 .config 片段（包含所有需要的包）
         cat >> .config << 'CONFIGEOF'
-
         # === 目标平台 x86_64 ===
         CONFIG_TARGET_x86=y
         CONFIG_TARGET_x86_64=y
-
         # === 中文语言包 (zh-cn命名，25.12不变) ===
         CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
         CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
         CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
         CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
         CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
-
         # === LuCI 应用 ===
         CONFIG_PACKAGE_luci-app-ttyd=y
         CONFIG_PACKAGE_luci-app-upnp=y
@@ -149,7 +198,6 @@ jobs:
         CONFIG_PACKAGE_luci-app-uhttpd=y
         CONFIG_PACKAGE_luci-app-openclash=y
         CONFIG_PACKAGE_luci-app-homeproxy=y
-
         # === 网络工具 ===
         CONFIG_PACKAGE_miniupnpd-nftables=y
         CONFIG_PACKAGE_ddns-scripts=y
@@ -157,14 +205,9 @@ jobs:
         CONFIG_PACKAGE_ddns-scripts-dnspod=y
         CONFIG_PACKAGE_curl=y
         CONFIG_PACKAGE_ca-certificates=y
-
-        # === DDNSTO ===
-        CONFIG_PACKAGE_ddnsto=y
-
         # === 主题 ===
         CONFIG_PACKAGE_luci-theme-bootstrap=y
         CONFIGEOF
-
         echo "Build config created"
         grep -E "^(CONFIG_PACKAGE_|CONFIG_TARGET_)" .config | sort
 
@@ -180,7 +223,7 @@ jobs:
     - name: Download Packages
       run: |
         cd openwrt
-        make download -j$(nproc) DOWNLOAD_TIMEOUT=120 CHECK=1 2>&1 | tail -30 || true
+        make 内部工具 -j$(nproc) DOWNLOAD_TIMEOUT=120 CHECK=1 2>&1 | tail -30 || true
         find dl -size 0 -delete 2>/dev/null
         echo "Download complete"
 
@@ -192,20 +235,29 @@ jobs:
         echo "Using $MAKEJOBS parallel jobs"
         echo "Building firmware..."
         set -e
-        make -j${MAKEJOBS} || make -j1 V=s
+        # 构建并输出日志到 build.log
+        make -j${MAKEJOBS} LOG=build.log 2>&1 | tee build.log
         echo "Build completed successfully"
+        echo "build_success=true" >> $GITHUB_OUTPUT
 
     - name: Post-Build DDNSTO Integration
       if: steps.compile.outcome == 'success'
       run: |
         cd openwrt
-
-        # 创建files目录用于覆盖固件中的文件
+        echo "=== Starting DDNSTO Integration ==="
+        # 找到DDNSTO二进制文件
+        DDNSTO_BIN=""
+        if [ -f dl/ddnsto-x86_64 ] && [ -s dl/ddnsto-x86_64 ]; then
+          DDNSTO_BIN="dl/ddnsto-x86_64"
+        elif [ -f dl/ddnsto ] && [ -s dl/ddnsto ]; then
+          DDNSTO_BIN="dl/ddnsto"
+        fi
+        # 创建files目录用于注入文件到固件
         mkdir -p files/etc/config
         mkdir -p files/etc/init.d
         mkdir -p files/usr/bin
         mkdir -p files/etc/ddnsto
-
+        mkdir -p files/etc/uci-defaults
         # === 创建DDNSTO配置文件(默认关闭) ===
         cat > files/etc/config/ddnsto << 'DDNSTOEOF'
         config ddns_to 'config'
@@ -215,33 +267,25 @@ jobs:
         	option server 'tunnel.ddnsto.com'
         	option log_level 'info'
         DDNSTOEOF
-
         # === 创建DDNSTO init脚本(procd兼容，默认禁用) ===
         cat > files/etc/init.d/ddnsto << 'INITEOF'
         #!/bin/sh /etc/rc.common
         # DDNSTO init script - default disabled
-
         START=99
         STOP=10
-
         USE_PROCD=1
-
         start_service() {
         	local enabled
         	enabled=$(uci get ddnsto.config.enabled 2>/dev/null)
         	[ "$enabled" != "1" ] && return 1
-
         	local token
         	token=$(uci get ddnsto.config.token 2>/dev/null)
         	[ -z "$token" ] && return 1
-
         	local server
         	server=$(uci get ddnsto.config.server 2>/dev/null)
         	[ -z "$server" ] && server="tunnel.ddnsto.com"
-
         	# 检查二进制文件
         	[ -x /usr/bin/ddnsto ] || return 1
-
         	procd_open_instance
         	procd_set_param command /usr/bin/ddnsto
         	procd_append_param command -t "$token"
@@ -249,30 +293,25 @@ jobs:
         	procd_set_param respawn_threshold 300
         	procd_close_instance
         }
-
         stop_service() {
         	killall ddnsto 2>/dev/null
         }
-
         reload_service() {
         	stop_service
         	start_service
         }
-
         enable_service() {
         	uci set ddnsto.config.enabled=1
         	uci commit ddnsto
         }
-
         disable_service() {
         	uci set ddnsto.config.enabled=0
         	uci commit ddnsto
         }
         INITEOF
         chmod +x files/etc/init.d/ddnsto
-
         # === 创建开机初始化脚本(确保首次启动DDNSTO为禁用状态) ===
-        cat > files/etc/rc.d/S99ddnsto-init << 'RCEOF'
+        cat > files/etc/uci-defaults/99-ddnsto-init << 'RCEOF'
         #!/bin/sh
         # 确保 DDNSTO 默认不启动
         # 只在首次启动时生效，用户手动启用后不再覆盖
@@ -281,8 +320,14 @@ jobs:
         touch /etc/ddnsto-firstboot
         exit 0
         RCEOF
-        chmod +x files/etc/rc.d/S99ddnsto-init
-
+        chmod +x files/etc/uci-defaults/99-ddnsto-init
+        # === 复制DDNSTO二进制到files目录 ===
+        if [ -n "$DDNSTO_BIN" ]; then
+          cp "$DDNSTO_BIN" files/usr/bin/ddnsto
+          echo "DDNSTO binary copied to files/usr/bin/ddnsto"
+        else
+          echo "Warning: DDNSTO binary not available"
+        fi
         # === 覆盖网络配置(静态IP + 关闭DHCP) ===
         cat > files/etc/config/network << 'NETEOF'
         config interface 'loopback'
@@ -290,7 +335,6 @@ jobs:
         	option ipaddr '127.0.0.1'
         	option netmask '255.0.0.0'
         	option device 'lo'
-
         config interface 'lan'
         	option type 'bridge'
         	option proto 'static'
@@ -299,21 +343,18 @@ jobs:
         	option device 'br-lan'
         	option ip6assign '60'
         NETEOF
-
         # === 关闭DHCP服务器 ===
         cat > files/etc/config/dhcp << 'DHCP_EOF'
         config dhcp 'lan'
         	option interface 'lan'
         	option ignore '1'
         DHCP_EOF
-
         # === LuCI配置(中文 + bootstrap主题) ===
         cat > files/etc/config/luci << 'LUCIEOF'
         config core 'main'
         	option lang 'zh_cn'
         	option mediaurlbase '/luci-static/bootstrap'
         	option resourcebase '/luci-static/resources'
-
         config extern 'flash_keep'
         	option uci '/etc/config/'
         	option dropbear '/etc/dropbear/'
@@ -322,35 +363,28 @@ jobs:
         	option opkg '/etc/opkg.conf'
         	option firewall '/etc/firewall.user'
         	option uploads '/lib/uci/upload/'
-
         config internal 'languages'
-
         config internal 'auth'
         	option sessionpath '/tmp/luci-sessions'
         	option sessiontime '3600'
-
         config internal 'ccache'
         	option enable '1'
         LUCIEOF
-
-        # === 复制DDNSTO二进制到固件 ===
-        if [ -f dl/ddnsto ] && [ -s dl/ddnsto ]; then
-          cp dl/ddnsto files/usr/bin/ddnsto
-          echo "DDNSTO binary copied to files/usr/bin/ddnsto"
-        else
-          echo "Warning: DDNSTO binary not available, will need manual installation"
-        fi
-
-        # === 使用rsync覆盖文件到固件根目录 ===
-        TARGET_ROOT=$(find build_dir staging_dir -maxdepth 3 -name "root-x86" -type d 2>/dev/null | head -1)
+        # === 使用 rsync 将 files 目录内容注入固件 ===
+        TARGET_ROOT=$(find build_dir/target-x86_64* -name "root" -type d 2>/dev/null | head -1)
         if [ -n "$TARGET_ROOT" ]; then
+          echo "Found target root: $TARGET_ROOT"
           rsync -av --ignore-missing-args files/ "$TARGET_ROOT/" 2>/dev/null || true
           echo "Files copied to $TARGET_ROOT"
+        else
+          echo "Warning: Target root not found, trying alternative"
+          find build_dir -maxdepth 3 -name "root" -type d 2>/dev/null | while read d; do
+            echo "Copying to: $d"
+            rsync -av --ignore-missing-args files/ "$d/" 2>/dev/null || true
+          done
         fi
-
         # 清理临时files目录
         rm -rf files
-
         echo "Post-build DDNSTO integration completed"
 
     - name: Check Build Output
@@ -379,7 +413,7 @@ jobs:
 
     - name: Upload Firmware
       if: steps.compile.outcome == 'success' && github.event.inputs.upload_artifact == 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: ImmortalWrt-25.12.2-x86-64
         path: |
@@ -389,7 +423,7 @@ jobs:
 
     - name: Upload Build Log
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: build-log
         path: |
@@ -400,7 +434,7 @@ jobs:
       if: always()
       run: |
         echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
-        echo "- Source: immortalwrt v25.12.2" >> $GITHUB_STEP_SUMMARY
+        echo "- Source: immortalwrt" >> $GITHUB_STEP_SUMMARY
         echo "- Target: x86_64" >> $GITHUB_STEP_SUMMARY
         echo "- Kernel: ${{ github.event.inputs.kernel_version || '6.6' }}" >> $GITHUB_STEP_SUMMARY
         echo "- Backend IP: 192.168.50.2" >> $GITHUB_STEP_SUMMARY
@@ -427,4 +461,3 @@ jobs:
         echo "- luci-i18n-uhttpd-zh-cn" >> $GITHUB_STEP_SUMMARY
         echo "- luci-app-openclash" >> $GITHUB_STEP_SUMMARY
         echo "- luci-app-homeproxy" >> $GITHUB_STEP_SUMMARY
-        echo "- ddnsto" >> $GITHUB_STEP_SUMMARY
