@@ -1,0 +1,102 @@
+name: Build ImmortalWrt 25.12 x86_64 OpenClash SSRPlus
+
+on: workflow_dispatch:
+
+permissions: contents: read
+
+env: TZ: Asia/Shanghai OPENWRT_BRANCH: openwrt-25.12
+
+jobs: build: runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential clang flex bison gawk gettext gcc-multilib git libncurses-dev libssl-dev python3 rsync unzip wget curl zstd ccache
+
+      - name: Clone ImmortalWrt
+        run: |
+          git clone --depth=1 -b ${OPENWRT_BRANCH} https://github.com/immortalwrt/immortalwrt.git openwrt
+
+      - name: Add OpenClash
+        run: |
+          cd openwrt/package
+          git clone --depth=1 https://github.com/vernesong/OpenClash.git OpenClash
+          mv OpenClash/luci-app-openclash luci-app-openclash
+          rm -rf OpenClash
+
+      - name: Add SSR Plus
+        run: |
+          cd openwrt/package
+          git clone --depth=1 https://github.com/fw876/helloworld.git helloworld
+
+      - name: Generate config
+        run: |
+          cd openwrt
+          cat > .config <<'EOF'
+
+CONFIG_TARGET_x86=y CONFIG_TARGET_x86_64=y
+CONFIG_TARGET_x86_64_DEVICE_generic=y CONFIG_TARGET_IMAGES_GZIP=y
+CONFIG_TARGET_ROOTFS_SQUASHFS=y CONFIG_TARGET_ROOTFS_EXT4FS=y
+
+CONFIG_PACKAGE_luci=y CONFIG_PACKAGE_luci-theme-bootstrap=y
+CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+
+CONFIG_PACKAGE_luci-app-openclash=y
+CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=y
+CONFIG_PACKAGE_luci-app-homeproxy=y CONFIG_PACKAGE_luci-app-ssr-plus=y
+
+CONFIG_PACKAGE_ddnsto=y CONFIG_PACKAGE_luci-app-ddnsto=y
+
+CONFIG_PACKAGE_luci-app-ttyd=y CONFIG_PACKAGE_miniupnpd-nftables=y
+CONFIG_PACKAGE_luci-app-upnp=y CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+
+CONFIG_PACKAGE_ddns-scripts=y CONFIG_PACKAGE_luci-app-ddns=y
+CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+CONFIG_PACKAGE_ddns-scripts-dnspod=y
+
+CONFIG_PACKAGE_curl=y CONFIG_PACKAGE_ca-certificates=y
+
+CONFIG_PACKAGE_kmod-e1000=y CONFIG_PACKAGE_kmod-e1000e=y
+CONFIG_PACKAGE_kmod-igb=y CONFIG_PACKAGE_kmod-r8169=y
+CONFIG_PACKAGE_kmod-tg3=y CONFIG_PACKAGE_kmod-virtio-net=y
+CONFIG_PACKAGE_kmod-vmxnet3=y CONFIG_PACKAGE_kmod-tun=y
+CONFIG_PACKAGE_kmod-nft-tproxy=y CONFIG_PACKAGE_kmod-crypto-aesni=y
+CONFIG_PACKAGE_libopenssl=y EOF make defconfig
+
+      - name: Set default settings
+        run: |
+          cd openwrt
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-default-settings <<'EOF'
+
+#!/bin/sh
+
+uci set network.lan.ipaddr=‘192.168.1.2’ uci set
+network.lan.netmask=‘255.255.255.0’ uci commit network
+
+for service in openclash homeproxy shadowsocksr ddnsto; do if [ -x
+/etc/init.d/service]; then/etc/init.d/service disable
+/etc/init.d/$service stop fi done
+
+exit 0 EOF
+
+          chmod 755 files/etc/uci-defaults/99-default-settings
+
+      - name: Compile firmware
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+          make -j$(nproc) V=s
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v5
+        with:
+          name: ImmortalWrt-25.12-x86_64-E3-1265L-v2
+          compression-level: 9
+          path: openwrt/bin/targets/x86/64/*
