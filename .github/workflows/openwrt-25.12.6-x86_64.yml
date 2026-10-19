@@ -42,10 +42,22 @@ jobs:
 
       - name: Clone official OpenWrt 25.12.6 source
         run: |
+          # v25.12.6 is an annotated, signed release tag. A shallow clone can
+          # print a harmless tag-object warning, while still checking out the
+          # correct commit. Verify the resolved commit and tag explicitly.
           git clone --depth 1 --branch "${OPENWRT_TAG}" https://github.com/openwrt/openwrt.git openwrt
           cd openwrt
-          echo "OpenWrt source commit: $(git rev-parse --short HEAD)"
-          grep -q 'DISTRIB_RELEASE' include/version.mk
+          ACTUAL_COMMIT="$(git rev-parse HEAD)"
+          echo "OpenWrt source commit: ${ACTUAL_COMMIT}"
+          test -f include/version.mk
+          if [ "${OPENWRT_TAG}" = "v25.12.6" ]; then
+            EXPECTED_COMMIT="64900e756efa667774214f9c6b17c113222e01f7"
+            if [ "${ACTUAL_COMMIT}" != "${EXPECTED_COMMIT}" ]; then
+              echo "::error::Expected OpenWrt ${OPENWRT_TAG} commit ${EXPECTED_COMMIT}, got ${ACTUAL_COMMIT}"
+              exit 1
+            fi
+          fi
+          git describe --tags --exact-match HEAD
 
       - name: Update and install official feeds
         working-directory: openwrt
@@ -221,8 +233,6 @@ jobs:
           CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
 
           CONFIG_PACKAGE_luci-app-opkg=n
-          CONFIG_PACKAGE_luci-app-openclash=n
-          CONFIG_PACKAGE_luci-app-homeproxy=n
           CONFIG_PACKAGE_luci-app-ssr-plus=n
           CONFIG_PACKAGE_luci-app-passwall=n
           CONFIG_PACKAGE_luci-app-passwall2=n
@@ -237,7 +247,7 @@ jobs:
             ddns-scripts luci-app-ddns ddns-scripts-cloudflare ddns-scripts-dnspod \
             curl ca-certificates luci-app-uhttpd luci-app-statistics \
             collectd-mod-thermal kmod-thermal kmod-hwmon-core \
-            ddnsto luci-app-ddnsto luci-app-cpu-status-mini; do
+            ddnsto luci-app-ddnsto luci-app-cpu-status-mini \
             if ! grep -qx "CONFIG_PACKAGE_${p}=y" .config; then
               echo "::error::Requested package ${p} was not selected by OpenWrt 25.12.6 feeds/source."
               exit 1
