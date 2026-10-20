@@ -31,19 +31,21 @@ jobs:
           cd openwrt
           # cpu-status-mini（纯前端，无中文包、无可配采样间隔，见文末备注1）
           git clone --depth 1 https://github.com/gSpotx2f/luci-app-cpu-status-mini package/luci-app-cpu-status-mini
-          # homeproxy（sing-box 编译内置）
+          # homeproxy（sing-box 编译内置，官方 feed 提供 sing-box）
           git clone --depth 1 https://github.com/immortalwrt/homeproxy package/luci-app-homeproxy
-          # OpenClash sparse checkout 铺平（核心 mihomo 运行时 Web 界面下载，ipk 不含，见备注2）
+          # OpenClash sparse checkout 铺平（子 shell 内 cd，不影响外层工作目录）
           mkdir -p package/luci-app-openclash
-          cd package/luci-app-openclash
-          git init -q
-          git remote add -f origin https://github.com/vernesong/OpenClash.git
-          git config core.sparsecheckout true
-          echo "luci-app-openclash/*" >> .git/info/sparse-checkout
-          git pull --depth 1 -q origin master
-          mv luci-app-openclash/* . && rmdir luci-app-openclash
-          cd ../../..
-          # sonic-fullcone 官方脚本（内核/nft/libnftnl/防火墙补丁，无独立 ipk）
+          (
+            cd package/luci-app-openclash
+            git init -q
+            git remote add -f origin https://github.com/vernesong/OpenClash.git
+            git config core.sparsecheckout true
+            echo "luci-app-openclash/*" > .git/info/sparse-checkout
+            git pull --depth 1 -q origin master
+            mv luci-app-openclash/* .
+            rmdir luci-app-openclash
+          )
+          # sonic-fullcone 官方脚本（必须在 OpenWrt 源码根执行；feeds 已在上一步装好）
           curl -sSL https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
 
       - name: Extract official DDNSTO ipk (latest) into files/
@@ -189,7 +191,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: Doubao_openwrt-25.12-x86-64_15.1
+          name: Doubao_OpenWrt-25.12-x86-64_15.1
           retention-days: 14
           path: |
             openwrt/bin/targets/x86/64/*combined*.img.gz
@@ -201,4 +203,6 @@ jobs:
 # 2. OpenClash 核心 mihomo 二进制不编译进 ipk，刷机后进 Web 界面手动下载。
 # 3. 选 luci-app-openclash 会自动以 dnsmasq-full 替换 dnsmasq，属正常。
 # 4. 全部第三方包每次构建拉最新 commit，未锁版本号。
+# 5. sonic-fullcone 打补丁后无需额外勾选，刷机后在防火墙页开 fullcone，或：
+#    uci set firewall.@defaults[0].fullcone='1' && uci set firewall.@zone[1].fullcone='1' && uci commit firewall && /etc/init.d/firewall restart
 #（注：内容由AI生成）
