@@ -1,0 +1,290 @@
+name: OpenWrt-25.12-SNAPSHOT-x86-64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+  OPENWRT_REPO: https://github.com/openwrt/openwrt.git
+  OPENWRT_BRANCH: openwrt-25.12
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+            python3-pyelftools python3-dev rsync unzip zlib1g-dev file wget curl \
+            ca-certificates ecj fastjar java-propose-classpath libelf-dev \
+            libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libreadline-dev libsqlite3-dev libtool lz4 \
+            msmtp nano p7zip-full patch pkgconf qemu-utils subversion swig \
+            time xsltproc xz-utils
+
+      - name: Clone official OpenWrt 25.12-SNAPSHOT source
+        run: |
+          git clone --depth 1 --branch "$OPENWRT_BRANCH" "$OPENWRT_REPO" openwrt
+          cd openwrt
+          echo "OpenWrt commit: $(git rev-parse HEAD)"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Add third-party packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openwrt
+          mkdir -p package/custom
+
+          git clone --depth 1 https://github.com/gSpotx2f/luci-app-cpu-status-mini.git \
+            package/custom/luci-app-cpu-status-mini
+
+          git clone --depth 1 https://github.com/immortalwrt/homeproxy.git \
+            package/custom/luci-app-homeproxy
+
+          git clone --depth 1 https://github.com/vernesong/OpenClash.git /tmp/OpenClash
+          test -d /tmp/OpenClash/luci-app-openclash
+          cp -a /tmp/OpenClash/luci-app-openclash package/custom/
+
+          # DDNSTO official integration: use the official x86_64 binary and
+          # the official LuCI package's payload, not its opkg/apk metadata.
+          # This avoids attempting to install a foreign package manager's package
+          # into the OpenWrt build root. The image will ship with DDNSTO disabled.
+          mkdir -p files/usr/bin files/etc/config /tmp/ddnsto
+          curl -fL --retry 3 --connect-timeout 20 \
+            https://fw.koolcenter.com/binary/ddnsto/openwrt/x86_64/ddnsto \
+            -o files/usr/bin/ddnsto
+          chmod 0755 files/usr/bin/ddnsto
+
+          curl -fL --retry 3 --connect-timeout 20 \
+            http://fw.koolcenter.com/binary/ddnsto/openwrt/luci-app-ddnsto.ipk \
+            -o /tmp/ddnsto/luci-app-ddnsto.ipk
+          curl -fL --retry 3 --connect-timeout 20 \
+            http://fw.koolcenter.com/binary/ddnsto/openwrt/luci-i18n-ddnsto-zh-cn.ipk \
+            -o /tmp/ddnsto/luci-i18n-ddnsto-zh-cn.ipk || true
+
+          extract_package_data() {
+            local pkg="$1" out="$2" work
+            work="$(mktemp -d)"
+            if file "$pkg" | grep -qi 'Debian binary package'; then
+              (cd "$work" && ar x "$pkg")
+              if [ -f "$work/data.tar.gz" ]; then
+                tar -xzf "$work/data.tar.gz" -C "$out"
+              elif [ -f "$work/data.tar.xz" ]; then
+                tar -xJf "$work/data.tar.xz" -C "$out"
+              elif [ -f "$work/data.tar.zst" ]; then
+                tar --zstd -xf "$work/data.tar.zst" -C "$out"
+              else
+                echo "No supported data archive in $pkg" >&2
+                exit 1
+              fi
+            else
+              # Some older vendor packages are gzip-compressed tar archives.
+              if tar -tzf "$pkg" >/dev/null 2>&1; then
+                tar -xzf "$pkg" -C "$out"
+              else
+                echo "Unrecognized DDNSTO package format: $pkg" >&2
+                exit 1
+              fi
+            fi
+            rm -rf "$work"
+          }
+
+          extract_package_data /tmp/ddnsto/luci-app-ddnsto.ipk files
+          if [ -s /tmp/ddnsto/luci-i18n-ddnsto-zh-cn.ipk ]; then
+            extract_package_data /tmp/ddnsto/luci-i18n-ddnsto-zh-cn.ipk files
+          fi
+
+          # Official UI/init files are retained, but the default config is
+          # explicitly provisioned so first boot does not enable the service.
+          # Do not add a token: the owner must enter it in LuCI.
+          cat > files/etc/config/ddnsto <<'EOF'
+          config ddnsto 'config'
+              option enabled '0'
+              option token ''
+          EOF
+
+          # sonic-fullcone documents support for OpenWrt 25.12 and requires
+          # feeds to be installed before running its patching script.
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh \
+            -o /tmp/add_sonic_fullcone.sh
+          bash /tmp/add_sonic_fullcone.sh
+
+      - name: Configure image and packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_miniupnpd-nftables=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+          CONFIG_PACKAGE_ddns-scripts-dnspod=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-certificates=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+          CONFIG_PACKAGE_luci-app-uhttpd=y
+          CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
+
+          CONFIG_PACKAGE_luci-app-statistics=y
+          CONFIG_PACKAGE_collectd-mod-thermal=y
+          CONFIG_PACKAGE_kmod-thermal=y
+          CONFIG_PACKAGE_kmod-hwmon-core=y
+          CONFIG_PACKAGE_luci-i18n-statistics-zh-cn=y
+
+          CONFIG_PACKAGE_luci-app-cpu-status-mini=y
+          CONFIG_PACKAGE_luci-app-homeproxy=y
+          CONFIG_PACKAGE_luci-i18n-homeproxy-zh-cn=y
+          CONFIG_PACKAGE_luci-app-openclash=y
+
+          CONFIG_PACKAGE_bash=y
+          CONFIG_PACKAGE_ruby=y
+          CONFIG_PACKAGE_ruby-yaml=y
+          CONFIG_PACKAGE_unzip=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_ipset=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_firewall4=y
+          CONFIG_PACKAGE_dnsmasq-full=y
+
+          # Physical NIC drivers: Intel, Realtek, Broadcom, Marvell/Aquantia.
+          CONFIG_PACKAGE_kmod-e1000=y
+          CONFIG_PACKAGE_kmod-e1000e=y
+          CONFIG_PACKAGE_kmod-igb=y
+          CONFIG_PACKAGE_kmod-ixgbe=y
+          CONFIG_PACKAGE_kmod-ixgbevf=y
+          CONFIG_PACKAGE_kmod-r8169=y
+          CONFIG_PACKAGE_kmod-atlantic=y
+          CONFIG_PACKAGE_kmod-tg3=y
+          CONFIG_PACKAGE_kmod-bnx2=y
+          CONFIG_PACKAGE_kmod-bnx2x=y
+          CONFIG_PACKAGE_kmod-be2net=y
+          CONFIG_PACKAGE_kmod-mvneta=y
+          CONFIG_PACKAGE_kmod-mvpp2=y
+
+          # Virtual machine / paravirtual drivers: KVM/QEMU, VMware, Hyper-V, Xen.
+          CONFIG_PACKAGE_kmod-virtio-net=y
+          CONFIG_PACKAGE_kmod-virtio-pci=y
+          CONFIG_PACKAGE_kmod-virtio-ring=y
+          CONFIG_PACKAGE_kmod-virtio=y
+          CONFIG_PACKAGE_kmod-vmxnet3=y
+          CONFIG_PACKAGE_kmod-hyperv-net=y
+          CONFIG_PACKAGE_kmod-xen-netfront=y
+          CONFIG_PACKAGE_kmod-9pnet=y
+          CONFIG_PACKAGE_kmod-9pvirtio=y
+          CONFIG_PACKAGE_kmod-vsock-virtio=y
+          EOF
+
+          # Remove indentation introduced by the YAML block while preserving
+          # comments and Kconfig syntax.
+          sed -i 's/^[[:space:]]*//' .config
+
+          # The sonic-fullcone patch integrates into existing kernel/firewall
+          # packages; no separate fullcone package option is required.
+          make defconfig
+
+          # Fail early if requested core packages were silently dropped.
+          for pkg in luci luci-theme-bootstrap luci-app-openclash luci-app-homeproxy \
+                     luci-app-cpu-status-mini luci-app-ddns luci-app-upnp \
+                     luci-app-statistics; do
+            grep -qx "CONFIG_PACKAGE_${pkg}=y" .config || {
+              echo "Required package was not selected by defconfig: ${pkg}" >&2
+              exit 1
+            }
+          done
+
+      - name: Set LAN address and LuCI defaults
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openwrt
+          mkdir -p files/etc/config files/etc/uci-defaults
+
+          cat > files/etc/config/luci <<'EOF'
+          config core 'main'
+              option lang 'zh_cn'
+              option mediaurlbase '/luci-static/bootstrap'
+          EOF
+
+          cat > files/etc/uci-defaults/10-lan-address <<'EOF'
+          #!/bin/sh
+          uci -q set network.lan.ipaddr='192.168.15.1'
+          uci -q set network.lan.netmask='255.255.255.0'
+          uci -q commit network
+          exit 0
+          EOF
+
+          chmod 0755 files/etc/uci-defaults/10-lan-address
+
+          # Validate DDNSTO payload and keep service disabled on first boot.
+          test -x files/usr/bin/ddnsto
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/90-ddnsto-defaults <<'EOF'
+          #!/bin/sh
+          uci -q set ddnsto.config.enabled='0'
+          uci -q set ddnsto.config.token=''
+          uci -q commit ddnsto
+          exit 0
+          EOF
+          chmod 0755 files/etc/uci-defaults/90-ddnsto-defaults
+
+      - name: Download sources
+        run: |
+          cd openwrt
+          make download -j8
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openwrt
+          make -j"$(nproc)" V=s
+
+      - name: Verify output files
+        run: |
+          set -euo pipefail
+          find openwrt/bin/targets/x86/64 -maxdepth 1 -type f -printf '%f\n' | sort
+          test -n "$(find openwrt/bin/targets/x86/64 -maxdepth 1 -type f \( -name '*combined*.img.gz' -o -name '*combined*.efi' -o -name '*rootfs.tar.gz' \) -print -quit)"
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: OpenWrt-25.12-SNAPSHOT-x86-64
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            openwrt/bin/targets/x86/64/*combined*.img.gz
+            openwrt/bin/targets/x86/64/*combined*.efi
+            openwrt/bin/targets/x86/64/*rootfs.tar.gz
+            openwrt/bin/targets/x86/64/sha256sums
