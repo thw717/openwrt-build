@@ -11,7 +11,6 @@ on:
 env:
   REPO_URL: https://github.com/openwrt/openwrt
   REPO_BRANCH: openwrt-25.12
-  CONFIG_FILE: .config
   TZ: Asia/Shanghai
 
 jobs:
@@ -48,32 +47,37 @@ jobs:
           cd openwrt
           ./scripts/feeds update -a
 
-      # ========== 关键：加入第三方包源 & 定制包 ==========
+      # ========== 注入第三方包 ==========
       - name: Add custom packages
         run: |
           cd openwrt
 
-          # 1. sonic-fullcone（一键注入补丁）
+          # 1. sonic-fullcone（一键注入，自动识别 25.12 / 内核 6.12）
           curl -sSL https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
 
           # 2. luci-app-cpu-status-mini
           git clone --depth 1 https://github.com/gSpotx2f/luci-app-cpu-status-mini.git package/luci-app-cpu-status-mini
 
-          # 3. OpenClash
+          # 3. OpenClash（插件本体，内核稍后单独集成）
           git clone --depth 1 https://github.com/vernesong/OpenClash.git package/luci-app-openclash
 
-          # 4. homeproxy
+          # 4. homeproxy（使用 immortalwrt 仓库）
           git clone --depth 1 https://github.com/immortalwrt/homeproxy.git package/luci-app-homeproxy
 
-          # 5. DDNSTO（使用官方 all-in-one 脚本，但改造默认行为）
-          #    先获取官方安装脚本，再覆盖其 UCI 默认配置
-          git clone --depth 1 https://github.com/linkease/ddnsto_all_in_one_script.git /tmp/ddnsto-script
-          mkdir -p package/luci-app-ddnsto
-          cp -r /tmp/ddnsto-script/openwrt/* package/luci-app-ddnsto/ 2>/dev/null || true
+          # 5. DDNSTO 官方客户端二进制（x86_64 对应 amd64）
+          mkdir -p package/luci-app-ddnsto/files
+          curl -fsSL --retry 3 \
+            "https://fw.koolcenter.com/binary/ddnsto/openwrt/amd64/ddnsto" \
+            -o package/luci-app-ddnsto/files/ddnsto
+          chmod 0755 package/luci-app-ddnsto/files/ddnsto
 
-          # 如果官方脚本没有提供标准 Makefile，则手动写入最小 Makefile
-          if [ ! -f package/luci-app-ddnsto/Makefile ]; then
-            cat > package/luci-app-ddnsto/Makefile <<'EOF'
+      # ========== DDNSTO：编写 Makefile / init / uci-defaults ==========
+      - name: Prepare DDNSTO package
+        run: |
+          cd openwrt/package/luci-app-ddnsto
+
+          # Makefile：打包二进制、init 脚本、默认配置
+          cat > Makefile <<'EOF'
           include $(TOPDIR)/rules.mk
 
           PKG_NAME:=luci-app-ddnsto
@@ -93,26 +97,16 @@ jobs:
 
           define Package/luci-app-ddnsto/install
           	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/init.d $(1)/etc/config $(1)/etc/uci-defaults
-          	# 二进制（从官方地址下载，x86_64 使用 amd64 目录）
-          	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ddnsto $(1)/usr/bin/ddnsto
+          	$(INSTALL_BIN) ./files/ddnsto $(1)/usr/bin/ddnsto
           	$(INSTALL_BIN) ./files/ddnsto.init $(1)/etc/init.d/ddnsto
           	$(INSTALL_CONF) ./files/ddnsto.config $(1)/etc/config/ddnsto
-          	# 关键：uci-defaults 脚本，确保首次启动时开关为“关闭”
           	$(INSTALL_BIN) ./files/99-ddnsto-defaults $(1)/etc/uci-defaults/99-ddnsto-defaults
           endef
 
           $(eval $(call BuildPackage,luci-app-ddnsto))
           EOF
-          fi
 
-      # ========== 关键：定制 DDNSTO 的默认配置 ==========
-      - name: Customize DDNSTO defaults
-        run: |
-          cd openwrt/package/luci-app-ddnsto
-
-          mkdir -p files
-
-          # 1. init 脚本
+          # init 脚本：仅当 enabled=1 且 token 非空时才启动 procd 实例
           cat > files/ddnsto.init <<'EOF'
           #!/bin/sh /etc/rc.common
           START=99
@@ -146,14 +140,14 @@ jobs:
           EOF
           chmod +x files/ddnsto.init
 
-          # 2. UCI 默认配置：enabled=0，token 为空
+          # 默认配置：enabled=0，token 为空
           cat > files/ddnsto.config <<'EOF'
           config ddnsto 'config'
             option enabled '0'
             option token ''
           EOF
 
-          # 3. uci-defaults：确保刷机后首次启动是“关闭”状态
+          # uci-defaults：首次启动时兜底强制关闭并清空 token
           cat > files/99-ddnsto-defaults <<'EOF'
           #!/bin/sh
           uci -q get ddnsto.config.enabled >/dev/null 2>&1 || {
@@ -165,15 +159,10 @@ jobs:
           EOF
           chmod +x files/99-ddnsto-defaults
 
-      # ========== 关键：定制 cpu-status-mini 采样间隔 ==========
+      # ========== cpu-status-mini：采样间隔改为 1 秒 ==========
       - name: Customize cpu-status-mini interval
         run: |
           cd openwrt/package/luci-app-cpu-status-mini
-          # 默认 interval.cpu = 5，改为 1
-          if [ -f root/etc/config/luci ]; then
-            sed -i "s/option interval_cpu '5'/option interval_cpu '1'/" root/etc/config/luci 2>/dev/null || true
-          fi
-          # 如果配置在 ucitrack 或单独配置中，直接写 uci-defaults 兜底
           mkdir -p root/etc/uci-defaults
           cat > root/etc/uci-defaults/99-cpu-status-interval <<'EOF'
           #!/bin/sh
@@ -212,7 +201,7 @@ jobs:
           CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
           CONFIG_PACKAGE_luci-theme-bootstrap=y
 
-          # Physical NIC drivers
+          # Physical NIC drivers (含 82579LM / 82574L)
           CONFIG_PACKAGE_kmod-e1000e=y
           CONFIG_PACKAGE_kmod-igb=y
           CONFIG_PACKAGE_kmod-ixgbe=y
@@ -220,7 +209,7 @@ jobs:
           CONFIG_PACKAGE_kmod-r8125=y
           CONFIG_PACKAGE_kmod-atlantic=y
 
-          # Virtualization
+          # Virtualization (KVM 等)
           CONFIG_PACKAGE_kmod-virtio-net=y
           CONFIG_PACKAGE_kmod-virtio-pci=y
           CONFIG_PACKAGE_kmod-virtio-blk=y
@@ -232,7 +221,7 @@ jobs:
           CONFIG_PACKAGE_kmod-kvm-intel=y
           CONFIG_PACKAGE_qemu-ga=y
 
-          # User-specified packages
+          # 用户指定包
           CONFIG_PACKAGE_luci-app-ttyd=y
           CONFIG_PACKAGE_miniupnpd-nftables=y
           CONFIG_PACKAGE_luci-app-upnp=y
@@ -252,15 +241,13 @@ jobs:
           CONFIG_PACKAGE_kmod-hwmon-core=y
           CONFIG_PACKAGE_luci-i18n-statistics-zh-cn=y
 
-          # DDNSTO (our customized package)
+          # DDNSTO（自定义包）
           CONFIG_PACKAGE_luci-app-ddnsto=y
-
-          # sonic-fullcone is applied as kernel patch, no menuconfig selection needed
 
           # cpu-status-mini
           CONFIG_PACKAGE_luci-app-cpu-status-mini=y
 
-          # OpenClash
+          # OpenClash 依赖
           CONFIG_PACKAGE_luci-app-openclash=y
           CONFIG_PACKAGE_dnsmasq-full=y
           CONFIG_PACKAGE_bash=y
@@ -276,7 +263,7 @@ jobs:
           CONFIG_PACKAGE_ipset=y
           CONFIG_PACKAGE_luci-compat=y
 
-          # homeproxy
+          # homeproxy（sing-box 引擎）
           CONFIG_PACKAGE_luci-app-homeproxy=y
           CONFIG_PACKAGE_luci-i18n-homeproxy-zh-cn=y
           CONFIG_PACKAGE_sing-box=y
@@ -284,26 +271,60 @@ jobs:
           CONFIG_PACKAGE_kmod-nft-tproxy=y
           CONFIG_PACKAGE_ucode-mod-digest=y
 
-          # Other
+          # 常用工具
           CONFIG_PACKAGE_htop=y
           CONFIG_PACKAGE_nano=y
           EOF
 
-      - name: Download Clash core (OpenClash)
+      # ========== OpenClash 内核：多源容错集成 ==========
+      - name: Download and Integrate Clash Meta Core
         run: |
           cd openwrt
-          mkdir -p files/etc/openclash/core
+          CORE_DIR="files/etc/openclash/core"
+          mkdir -p "$CORE_DIR"
+          CORE_PATH="$CORE_DIR/clash_meta"
+          TMP_TAR="/tmp/clash-linux-amd64.tar.gz"
 
-          # 获取 OpenClash 最新 Release 的 clash_meta 内核（linux-amd64）
-          LATEST=$(curl -s https://api.github.com/repos/vernesong/OpenClash/releases/latest | grep 'browser_download_url' | grep 'linux-amd64' | grep 'clash_meta' | head -1 | cut -d'"' -f4)
-          if [ -n "$LATEST" ]; then
-            wget -q "$LATEST" -O files/etc/openclash/core/clash_meta
-            chmod +x files/etc/openclash/core/clash_meta
-          else
-            # 兜底：从 MetaCubeX 下载最新 mihomo 内核
-            wget -q https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64-compatible -O files/etc/openclash/core/clash_meta
-            chmod +x files/etc/openclash/core/clash_meta
+          # 按优先级排列的下载源（官方 raw / Release 直链 / jsDelivr 镜像）
+          URLS=(
+            "https://raw.githubusercontent.com/vernesong/OpenClash/core/master/meta/clash-linux-amd64.tar.gz"
+            "https://github.com/vernesong/OpenClash/releases/download/Clash/clash-linux-amd64.tar.gz"
+            "https://cdn.jsdelivr.net/gh/vernesong/OpenClash@core/master/meta/clash-linux-amd64.tar.gz"
+          )
+
+          DOWNLOAD_SUCCESS=0
+          for url in "${URLS[@]}"; do
+            echo "🔽 尝试下载: $url"
+            if curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 20 "$url" -o "$TMP_TAR"; then
+              if file "$TMP_TAR" | grep -qi "gzip compressed"; then
+                echo "✅ 文件格式有效"
+                DOWNLOAD_SUCCESS=1
+                break
+              else
+                echo "⚠️ 不是有效的 gzip，尝试下一个..."
+              fi
+            else
+              echo "⚠️ 下载失败，尝试下一个..."
+            fi
+          done
+
+          if [ "$DOWNLOAD_SUCCESS" -ne 1 ]; then
+            echo "❌ 所有下载源均失败"
+            exit 1
           fi
+
+          tar -xzf "$TMP_TAR" -C /tmp/
+          EXTRACTED_BIN=$(find /tmp -maxdepth 1 -type f -name "clash*" ! -name "*.tar.gz" | head -1)
+          if [ -z "$EXTRACTED_BIN" ]; then
+            echo "❌ 解压后未找到内核二进制文件"
+            exit 1
+          fi
+
+          mv "$EXTRACTED_BIN" "$CORE_PATH"
+          chmod 0755 "$CORE_PATH"
+          echo "✅ 内核已就绪: $CORE_PATH"
+          ls -lh "$CORE_PATH"
+          file "$CORE_PATH"
 
       - name: Configure LuCI default language
         run: |
