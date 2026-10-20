@@ -67,7 +67,7 @@ jobs:
           # 5. DDNSTO 官方客户端二进制（x86_64 对应 amd64）
           mkdir -p package/luci-app-ddnsto/files
           curl -fsSL --retry 3 \
-            "https://fw.koolcenter.com/binary/ddnsto/openwrt/amd64/ddnsto" \
+            "https://fw.koolcenter.com/binary/ddnsto/openwrt/x86_64/ddnsto" \
             -o package/luci-app-ddnsto/files/ddnsto
           chmod 0755 package/luci-app-ddnsto/files/ddnsto
 
