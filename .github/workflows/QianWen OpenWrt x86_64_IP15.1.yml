@@ -1,0 +1,308 @@
+# ============================================================
+# OpenWrt x86_64 固件编译工作流
+# ============================================================
+# 基于 OpenWrt 官方源码 25.12-SNAPSHOT 分支
+# 目标架构: x86_64
+# 后台LAN地址: 192.168.15.1/24
+# 主题: bootstrap (默认)
+# 语言: 简体中文
+# ============================================================
+# 第三方包来源:
+#   - ddnsto:                    kenzok8/openwrt-packages
+#   - sonic-fullcone:             mufeng05/openwrt-sonic-fullcone
+#   - luci-app-cpu-status-mini:   gSpotx2f/luci-app-cpu-status-mini
+#   - OpenClash:                  vernesong/OpenClash
+#   - homeproxy:                  immortalwrt/homeproxy
+# ============================================================
+# OpenWrt 25.12 重要变更须知:
+#   [1] 包管理器已由 opkg 切换为 APK (Alpine Package Keeper)
+#   [2] 内核升级至 Linux 6.12，GCC 14.3，glibc 2.41
+#   [3] Wi-Fi 管理脚本由 Shell 替换为 ucode
+#   [4] 中文包命名注意: zh-cn vs zh_Hans (见下方配置注释)
+#   [5] 默认包含 videofeed 软件源 (Qt5 图形界面应用)
+# ============================================================
+
+name: QianWen OpenWrt x86_64_IP15.1
+
+on:
+  # 仅手动触发工作流
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build OpenWrt Firmware
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      # ========================================================
+      # Step 1: 检出 OpenWrt 官方源码 (25.12-SNAPSHOT 分支)
+      # ========================================================
+      - name: Checkout OpenWrt Source
+        uses: actions/checkout@v5
+        with:
+          repository: openwrt/openwrt
+          ref: 25.12-SNAPSHOT
+          submodules: recursive
+
+      # ========================================================
+      # Step 2: 安装编译依赖环境
+      # ========================================================
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib \
+            g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3 python3-setuptools rsync subversion unzip \
+            zlib1g-dev file jq wget curl
+          # 清理不必要的包以释放磁盘空间
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+
+      # ========================================================
+      # Step 3: 更新并安装官方 Feeds
+      # ========================================================
+      - name: Update Official Feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ========================================================
+      # Step 4: 添加第三方包仓库 (克隆至 package/ 目录)
+      # ========================================================
+      - name: Add Third-Party Packages
+        run: |
+          echo "=== 添加第三方包仓库 ==="
+
+          # [1] DDNSTO - 来自 kenzok8/openwrt-packages
+          echo ">>> 克隆 kenzok8/openwrt-packages (含 DDNSTO)..."
+          git clone https://github.com/kenzok8/openwrt-packages.git package/kenzok8-packages
+
+          # [2] sonic-fullcone - 来自 mufeng05/openwrt-sonic-fullcone
+          echo ">>> 克隆 mufeng05/openwrt-sonic-fullcone..."
+          git clone https://github.com/mufeng05/openwrt-sonic-fullcone.git package/sonic-fullcone
+
+          # [3] luci-app-cpu-status-mini - 来自 gSpotx2f/luci-app-cpu-status-mini
+          echo ">>> 克隆 gSpotx2f/luci-app-cpu-status-mini..."
+          git clone https://github.com/gSpotx2f/luci-app-cpu-status-mini.git package/luci-app-cpu-status-mini
+
+          # [4] OpenClash - 来自 vernesong/OpenClash
+          echo ">>> 克隆 vernesong/OpenClash..."
+          git clone https://github.com/vernesong/OpenClash.git package/openclash
+
+          # [5] homeproxy - 来自 immortalwrt/homeproxy
+          echo ">>> 克隆 immortalwrt/homeproxy..."
+          git clone https://github.com/immortalwrt/homeproxy.git package/homeproxy
+
+          echo "=== 第三方包克隆完成 ==="
+          echo "package/ 目录内容:"
+          ls -la package/
+
+      # ========================================================
+      # Step 5: 重新安装 Feeds (扫描第三方包)
+      # ========================================================
+      - name: Reinstall Feeds (含第三方)
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ========================================================
+      # Step 6: 配置编译选项 (.config)
+      # ========================================================
+      - name: Configure Build
+        run: |
+          echo "=== [1/7] 生成默认配置 ==="
+          make defconfig
+
+          echo "=== [2/7] 配置目标架构: x86_64 ==="
+          # 启用 x86 目标平台
+          sed -i 's/# CONFIG_TARGET_x86 is not set/CONFIG_TARGET_x86=y/' .config
+          # 启用 x86_64 64位子目标
+          sed -i 's/# CONFIG_TARGET_x86_64 is not set/CONFIG_TARGET_x86_64=y/' .config
+
+          echo "=== [3/7] 配置后台LAN地址: 192.168.15.1/24 ==="
+          # 修改 x86 平台默认 LAN IP
+          sed -i 's/192.168.1.1/192.168.15.1/g' target/linux/x86/base-files/etc/board.d/02_network
+          sed -i 's/192.168.1.1/192.168.15.1/g' target/linux/x86/base-files/etc/dhcp.conf 2>/dev/null || true
+
+          echo "=== [4/7] 启用 Bootstrap 默认主题 ==="
+          sed -i 's/# CONFIG_PACKAGE_luci-theme-bootstrap is not set/CONFIG_PACKAGE_luci-theme-bootstrap=y/' .config
+          # 禁用其他主题避免冲突
+          sed -i 's/# CONFIG_PACKAGE_luci-theme-material is not set/CONFIG_PACKAGE_luci-theme-material=n/' .config 2>/dev/null || true
+          sed -i 's/# CONFIG_PACKAGE_luci-theme-argon is not set/CONFIG_PACKAGE_luci-theme-argon=n/' .config 2>/dev/null || true
+
+          echo "=== [5/7] 启用主流物理网卡驱动 ==="
+          # Intel 系列网卡驱动
+          sed -i 's/# CONFIG_PACKAGE_kmod-e1000e is not set/CONFIG_PACKAGE_kmod-e1000e=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-ixgbe is not set/CONFIG_PACKAGE_kmod-ixgbe=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-igb is not set/CONFIG_PACKAGE_kmod-igb=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-i40e is not set/CONFIG_PACKAGE_kmod-i40e=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-e1000 is not set/CONFIG_PACKAGE_kmod-e1000=y/' .config
+          # Realtek 系列网卡驱动
+          sed -i 's/# CONFIG_PACKAGE_kmod-r8169 is not set/CONFIG_PACKAGE_kmod-r8169=y/' .config
+          # Broadcom NetXtreme 网卡驱动
+          sed -i 's/# CONFIG_PACKAGE_kmod-tg3 is not set/CONFIG_PACKAGE_kmod-tg3=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-bnx2 is not set/CONFIG_PACKAGE_kmod-bnx2=y/' .config
+          # Mellanox ConnectX 网卡驱动
+          sed -i 's/# CONFIG_PACKAGE_kmod-mlx4-core is not set/CONFIG_PACKAGE_kmod-mlx4-core=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-mlx5-core is not set/CONFIG_PACKAGE_kmod-mlx5-core=y/' .config
+
+          echo "=== [6/7] 启用 KVM/虚拟机驱动 ==="
+          sed -i 's/# CONFIG_PACKAGE_kmod-virtio_net is not set/CONFIG_PACKAGE_kmod-virtio_net=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-virtio_blk is not set/CONFIG_PACKAGE_kmod-virtio_blk=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-virtio_scsi is not set/CONFIG_PACKAGE_kmod-virtio_scsi=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-virtio_pci is not set/CONFIG_PACKAGE_kmod-virtio_pci=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-virtio_balloon is not set/CONFIG_PACKAGE_kmod-virtio_balloon=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_kmod-vhost_net is not set/CONFIG_PACKAGE_kmod-vhost_net=y/' .config
+
+          echo "=== [7/7] 启用用户要求的软件包 ==="
+
+          # --- 官方源包 ---
+          echo "--- 官方源包 ---"
+          OFFICIAL_PACKAGES=" \
+            luci-i18n-base-zh-cn \
+            luci-i18n-firewall-zh-cn \
+            luci-app-ttyd \
+            miniupnpd-nftables \
+            luci-app-upnp \
+            luci-i18n-upnp-zh-cn \
+            ddns-scripts \
+            luci-app-ddns \
+            ddns-scripts-cloudflare \
+            ddns-scripts-dnspod \
+            curl \
+            ca-certificates \
+            luci-i18n-ddns-zh-cn \
+            luci-app-uhttpd \
+            luci-i18n-uhttpd-zh-cn \
+            luci-app-statistics \
+            collectd-mod-thermal \
+            kmod-thermal \
+            kmod-hwmon-core \
+            luci-i18n-statistics-zh-cn \
+          "
+          for pkg in $OFFICIAL_PACKAGES; do
+            echo "  [+] $pkg"
+            sed -i "s/# CONFIG_PACKAGE_${pkg} is not set/CONFIG_PACKAGE_${pkg}=y/" .config
+          done
+
+          # --- 第三方包 ---
+          echo "--- 第三方包 ---"
+          THIRD_PACKAGES=" \
+            luci-app-ddnsto \
+            sonic-fullcone \
+            luci-app-cpu-status-mini \
+            luci-app-openclash \
+            luci-app-homeproxy \
+          "
+          for pkg in $THIRD_PACKAGES; do
+            echo "  [+] $pkg"
+            sed -i "s/# CONFIG_PACKAGE_${pkg} is not set/CONFIG_PACKAGE_${pkg}=y/" .config
+          done
+
+          # --- 代理插件中文语言包 ---
+          echo "--- 代理插件中文语言包 ---"
+          sed -i "s/# CONFIG_PACKAGE_luci-i18n-homeproxy-zh-cn is not set/CONFIG_PACKAGE_luci-i18n-homeproxy-zh-cn=y/" .config
+
+          # ============================================================
+          # [重要] OpenWrt 25.12 中文包命名变更注意:
+          # --------------------------------------------------------
+          # OpenWrt 25.12 相比 24.08，语言包命名可能有变化:
+          #   - 旧版: luci-i18n-xxx-zh-cn
+          #   - 新版: 可能变为 luci-i18n-xxx-zh_Hans
+          #
+          # 如果编译时报 "Unknown package 'luci-i18n-xxx-zh-cn'" 错误:
+          #   1. 运行 make menuconfig 搜索 "zh_Hans" 查看可用语言包
+          #   2. 或将下方 zh_Hans 变体的注释去掉
+          # ============================================================
+          echo "--- 尝试启用 zh_Hans 变体 (OpenWrt 25.12 兼容) ---"
+          ZH_HANS_PACKAGES=" \
+            luci-i18n-base-zh_Hans \
+            luci-i18n-firewall-zh_Hans \
+            luci-i18n-upnp-zh_Hans \
+            luci-i18n-ddns-zh_Hans \
+            luci-i18n-uhttpd-zh_Hans \
+            luci-i18n-statistics-zh_Hans \
+            luci-i18n-homeproxy-zh_Hans \
+          "
+          for pkg in $ZH_HANS_PACKAGES; do
+            echo "  [?] $pkg"
+            sed -i "s/# CONFIG_PACKAGE_${pkg} is not set/CONFIG_PACKAGE_${pkg}=y/" .config
+          done
+
+          echo "=== 解析依赖关系 ==="
+          make defconfig
+
+          echo ""
+          echo "=== 配置验证 ==="
+          echo "--- 目标架构 ---"
+          grep "CONFIG_TARGET_x86" .config | grep -v "# " || echo "(未找到)"
+          echo "--- 已启用语言包 ---"
+          grep "CONFIG_PACKAGE.*luci-i18n.*zh" .config | grep -v "# " | sort || echo "(未找到)"
+          echo "--- 关键第三方包 ---"
+          for pkg in luci-app-openclash luci-app-homeproxy luci-app-cpu-status-mini sonic-fullcone luci-app-ddnsto; do
+            grep "CONFIG_PACKAGE_${pkg}" .config | grep -v "# " || echo "  [!] $pkg 未找到(可能包名不同)"
+          done
+
+      # ========================================================
+      # Step 7: 下载源码包 (预下载避免编译时网络问题)
+      # ========================================================
+      - name: Download Sources
+        run: |
+          echo "=== 下载源码包 ==="
+          make -j$(nproc) download
+          # 清理不完整的下载文件 (小于1KB的文件通常损坏)
+          find dl -size -1024c -exec ls -s {} \; 2>/dev/null | sort -n | head -20
+          find dl -size -1024c -exec rm -f {} \; 2>/dev/null
+          echo "下载完成"
+
+      # ========================================================
+      # Step 8: 编译固件
+      # ========================================================
+      - name: Build Firmware
+        run: |
+          echo "=== 开始编译固件 ==="
+          echo "CPU 核心数: $(nproc)"
+          echo "可用内存: $(free -h | awk '/^Mem:/{print $7}')"
+          echo "可用磁盘: $(df -h . | awk 'NR==2{print $4}')"
+          echo ""
+          # 先尝试全速并行编译; 若因内存不足失败则以单线程+详细输出重试
+          if ! make -j$(nproc); then
+            echo ""
+            echo "全速编译失败，尝试单线程详细模式以定位问题..."
+            make -j1 V=s
+          fi
+
+      # ========================================================
+      # Step 9: 上传编译产物 (固件镜像 + 软件包)
+      # ========================================================
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: QianWen OpenWrt x86_64_IP15.1
+          path: |
+            bin/targets/
+            build_dir/target-*/root-x86/
+          retention-days: 30
+          if-no-files-found: error
+
+      # ========================================================
+      # Step 10: 输出固件信息 (无论成功失败都执行)
+      # ========================================================
+      - name: Firmware Info
+        if: always()
+        run: |
+          echo "============================================"
+          echo "  编译产物清单"
+          echo "============================================"
+          echo ""
+          echo "--- 固件镜像 ---"
+          find bin/targets/ -type f \( -name "*.img.gz" -o -name "*.bin" -o -name "*.ext4.gz" -o -name "*.tar" \) 2>/dev/null | head -20
+          echo ""
+          echo "--- 软件包 ---"
+          find bin/packages/ -type f \( -name "*.ipk" -o -name "*.apk" \) 2>/dev/null | sort | head -40
+          echo ""
+          echo "--- 统计 ---"
+          echo "已启用包数量: $(grep -c 'CONFIG_PACKAGE_=y' .config 2>/dev/null || echo N/A)"
+          echo "固件输出目录: bin/targets/"
