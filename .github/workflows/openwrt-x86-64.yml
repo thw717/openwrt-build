@@ -1,20 +1,17 @@
 name: Build OpenWrt 25.12 x86_64
 
-on:
+"on":
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  OPENWRT_REPO: https://github.com/openwrt/openwrt.git
   OPENWRT_BRANCH: openwrt-25.12
-
   KENZO_REPO: https://github.com/kenzok8/openwrt-packages.git
   OPENCLASH_REPO: https://github.com/vernesong/OpenClash.git
   HOMEPROXY_REPO: https://github.com/immortalwrt/homeproxy.git
   CPU_STATUS_REPO: https://github.com/gSpotx2f/luci-app-cpu-status-mini.git
-  SONIC_REPO: https://github.com/mufeng05/openwrt-sonic-fullcone.git
 
 jobs:
   build:
@@ -23,9 +20,9 @@ jobs:
 
     steps:
 
-      # ============================================================
-      # 1. Checkout OpenWrt
-      # ============================================================
+      # ==========================================================
+      # Checkout OpenWrt 25.12
+      # ==========================================================
 
       - name: Checkout OpenWrt
         uses: actions/checkout@v5
@@ -35,10 +32,9 @@ jobs:
           fetch-depth: 1
           path: openwrt
 
-
-      # ============================================================
-      # 2. Install Ubuntu 24.04 build dependencies
-      # ============================================================
+      # ==========================================================
+      # Ubuntu 24.04 dependencies
+      # ==========================================================
 
       - name: Install build dependencies
         shell: bash
@@ -84,36 +80,25 @@ jobs:
           git --version
           gcc --version
 
+      # ==========================================================
+      # Add DDNSTO feed
+      # ==========================================================
 
-      # ============================================================
-      # 3. Configure third-party feeds
-      #
-      # DDNSTO:
-      #   kenzok8/openwrt-packages
-      #
-      # OpenClash / HomeProxy / CPU Status Mini:
-      #   Directly clone latest upstream source.
-      #
-      # This avoids feed/package conflicts with OpenWrt 25.12.
-      # ============================================================
-
-      - name: Configure third-party feeds
+      - name: Configure DDNSTO feed
         working-directory: openwrt
         shell: bash
         run: |
           set -eux
 
-          cat >> feeds.conf.default <<'EOF'
+          printf '%s\n' \
+            'src-git kenzo https://github.com/kenzok8/openwrt-packages.git' \
+            >> feeds.conf.default
 
-          src-git kenzo https://github.com/kenzok8/openwrt-packages.git
-          EOF
+      # ==========================================================
+      # Update OpenWrt feeds
+      # ==========================================================
 
-
-      # ============================================================
-      # 4. Update official + DDNSTO feeds
-      # ============================================================
-
-      - name: Update and install feeds
+      - name: Update feeds
         working-directory: openwrt
         shell: bash
         run: |
@@ -122,10 +107,9 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-
-      # ============================================================
-      # 5. Install DDNSTO from kenzok8
-      # ============================================================
+      # ==========================================================
+      # DDNSTO
+      # ==========================================================
 
       - name: Install DDNSTO
         working-directory: openwrt
@@ -136,24 +120,12 @@ jobs:
           ./scripts/feeds install -p kenzo ddnsto
           ./scripts/feeds install -p kenzo luci-app-ddnsto
 
-          test -e package/feeds/kenzo/ddnsto/Makefile
-          test -e package/feeds/kenzo/luci-app-ddnsto/Makefile
+          test -f package/feeds/kenzo/ddnsto/Makefile
+          test -f package/feeds/kenzo/luci-app-ddnsto/Makefile
 
-          echo "DDNSTO package:"
-          ls -la package/feeds/kenzo/ddnsto
-
-          echo "LuCI DDNSTO package:"
-          ls -la package/feeds/kenzo/luci-app-ddnsto
-
-
-      # ============================================================
-      # 6. Clone latest OpenClash
-      #
-      # OpenClash upstream repository:
-      # https://github.com/vernesong/OpenClash
-      #
-      # Do not lock version.
-      # ============================================================
+      # ==========================================================
+      # OpenClash
+      # ==========================================================
 
       - name: Add latest OpenClash
         working-directory: openwrt
@@ -165,7 +137,7 @@ jobs:
 
           git clone \
             --depth=1 \
-            "${OPENCLASH_REPO}" \
+            https://github.com/vernesong/OpenClash.git \
             package/openclash
 
           test -f package/openclash/luci-app-openclash/Makefile
@@ -173,26 +145,9 @@ jobs:
           echo "OpenClash commit:"
           git -C package/openclash rev-parse HEAD
 
-          echo "OpenClash version:"
-          grep -E '^PKG_VERSION:=' \
-            package/openclash/luci-app-openclash/Makefile || true
-
-
-      # ============================================================
-      # 7. Clone latest HomeProxy
-      #
-      # HomeProxy upstream repository:
-      # https://github.com/immortalwrt/homeproxy
-      #
-      # Current HomeProxy Makefile provides:
-      #   luci-app-homeproxy
-      #
-      # and depends on:
-      #   sing-box
-      #   firewall4
-      #   kmod-nft-tproxy
-      #   ucode-mod-digest
-      # ============================================================
+      # ==========================================================
+      # HomeProxy
+      # ==========================================================
 
       - name: Add latest HomeProxy
         working-directory: openwrt
@@ -204,7 +159,7 @@ jobs:
 
           git clone \
             --depth=1 \
-            "${HOMEPROXY_REPO}" \
+            https://github.com/immortalwrt/homeproxy.git \
             package/homeproxy
 
           test -f package/homeproxy/Makefile
@@ -212,19 +167,9 @@ jobs:
           echo "HomeProxy commit:"
           git -C package/homeproxy rev-parse HEAD
 
-          echo "HomeProxy Makefile:"
-          sed -n '1,100p' package/homeproxy/Makefile
-
-
-      # ============================================================
-      # 8. Clone latest CPU Status Mini
-      #
-      # Upstream:
-      # https://github.com/gSpotx2f/luci-app-cpu-status-mini
-      #
-      # Direct package injection is intentional because the author
-      # provides dedicated OpenWrt 25.12 APK packages.
-      # ============================================================
+      # ==========================================================
+      # CPU Status Mini
+      # ==========================================================
 
       - name: Add latest CPU Status Mini
         working-directory: openwrt
@@ -236,7 +181,7 @@ jobs:
 
           git clone \
             --depth=1 \
-            "${CPU_STATUS_REPO}" \
+            https://github.com/gSpotx2f/luci-app-cpu-status-mini.git \
             package/cpu-status-mini
 
           test -f package/cpu-status-mini/Makefile
@@ -244,19 +189,9 @@ jobs:
           echo "CPU Status Mini commit:"
           git -C package/cpu-status-mini rev-parse HEAD
 
-          echo "CPU Status Mini Makefile:"
-          sed -n '1,100p' package/cpu-status-mini/Makefile
-
-
-      # ============================================================
-      # 9. Apply SONiC Fullcone
-      #
-      # Official installation method from author:
-      #
-      # curl .../add_sonic_fullcone.sh | bash
-      #
-      # The author states 25.12 / kernel 6.12 is supported.
-      # ============================================================
+      # ==========================================================
+      # SONiC Fullcone
+      # ==========================================================
 
       - name: Apply SONiC Fullcone
         working-directory: openwrt
@@ -272,32 +207,11 @@ jobs:
 
           rm -f /tmp/add_sonic_fullcone.sh
 
-          echo "SONiC Fullcone patches:"
-          find target package feeds/luci \
-            -type f \
-            \( \
-              -name '*fullcone*' \
-              -o -name '984-*' \
-              -o -name '985-*' \
-              -o -name '986-*' \
-              -o -name '901-*' \
-              -o -name '001-add-fullcone-options.patch' \
-            \) \
-            -print 2>/dev/null || true
+      # ==========================================================
+      # Default LAN / LuCI settings
+      # ==========================================================
 
-
-      # ============================================================
-      # 10. Custom first-boot settings
-      #
-      # LAN:
-      #   192.168.15.1/24
-      #
-      # LuCI:
-      #   Simplified Chinese
-      #   Bootstrap
-      # ============================================================
-
-      - name: Configure default system settings
+      - name: Configure default settings
         working-directory: openwrt
         shell: bash
         run: |
@@ -308,35 +222,13 @@ jobs:
           cat > files/etc/uci-defaults/99-custom-defaults <<'EOF'
           #!/bin/sh
 
-          # ==========================================================
-          # LAN
-          # ==========================================================
-
           uci -q set network.lan.ipaddr='192.168.15.1'
           uci -q set network.lan.netmask='255.255.255.0'
 
-
-          # ==========================================================
-          # LuCI language
-          #
-          # OpenWrt LuCI uses zh_cn for Simplified Chinese.
-          # The translation package itself is named zh-cn.
-          # ==========================================================
-
           uci -q set luci.main.lang='zh_cn'
-
-
-          # ==========================================================
-          # Bootstrap theme
-          # ==========================================================
 
           uci -q set luci.themes.Bootstrap='/luci-static/bootstrap'
           uci -q set luci.main.mediaurlbase='/luci-static/bootstrap'
-
-
-          # ==========================================================
-          # Commit
-          # ==========================================================
 
           uci -q commit network
           uci -q commit luci
@@ -346,10 +238,9 @@ jobs:
 
           chmod +x files/etc/uci-defaults/99-custom-defaults
 
-
-      # ============================================================
-      # 11. OpenWrt configuration
-      # ============================================================
+      # ==========================================================
+      # OpenWrt configuration
+      # ==========================================================
 
       - name: Generate OpenWrt configuration
         working-directory: openwrt
@@ -359,41 +250,22 @@ jobs:
 
           cat > .config <<'EOF'
 
-          #
-          # ==========================================================
           # Target
-          # ==========================================================
-          #
-
           CONFIG_TARGET_x86=y
           CONFIG_TARGET_x86_64=y
           CONFIG_TARGET_x86_64_DEVICE_generic=y
 
-
-          #
-          # ==========================================================
-          # LuCI base
-          # ==========================================================
-          #
-
+          # LuCI
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-base=y
           CONFIG_PACKAGE_luci-mod-admin-full=y
           CONFIG_PACKAGE_luci-mod-network=y
           CONFIG_PACKAGE_luci-mod-status=y
           CONFIG_PACKAGE_luci-mod-system=y
-
           CONFIG_PACKAGE_luci-theme-bootstrap=y
 
+          # Simplified Chinese
           CONFIG_LUCI_LANG_zh_Hans=y
-
-
-          #
-          # ==========================================================
-          # Chinese language packages
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
@@ -401,111 +273,45 @@ jobs:
           CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-statistics-zh-cn=y
 
-
-          #
-          # ==========================================================
           # TTY
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_luci-app-ttyd=y
 
-
-          #
-          # ==========================================================
           # UPnP
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_miniupnpd-nftables=y
           CONFIG_PACKAGE_luci-app-upnp=y
 
-
-          #
-          # ==========================================================
           # DDNS
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_ddns-scripts=y
           CONFIG_PACKAGE_luci-app-ddns=y
           CONFIG_PACKAGE_ddns-scripts-cloudflare=y
           CONFIG_PACKAGE_ddns-scripts-dnspod=y
-
           CONFIG_PACKAGE_curl=y
           CONFIG_PACKAGE_ca-certificates=y
 
-          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
-
-
-          #
-          # ==========================================================
           # uHTTPd
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_luci-app-uhttpd=y
           CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
 
-
-          #
-          # ==========================================================
           # Statistics
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_luci-app-statistics=y
           CONFIG_PACKAGE_collectd-mod-thermal=y
           CONFIG_PACKAGE_kmod-thermal=y
           CONFIG_PACKAGE_kmod-hwmon-core=y
-          CONFIG_PACKAGE_luci-i18n-statistics-zh-cn=y
 
-
-          #
-          # ==========================================================
           # DDNSTO
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_ddnsto=y
           CONFIG_PACKAGE_luci-app-ddnsto=y
 
-
-          #
-          # ==========================================================
           # OpenClash
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_luci-app-openclash=y
 
-
-          #
-          # ==========================================================
           # HomeProxy
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_luci-app-homeproxy=y
 
-
-          #
-          # ==========================================================
           # CPU Status Mini
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_luci-app-cpu-status-mini=y
 
-
-          #
-          # ==========================================================
-          # Physical Ethernet drivers
-          #
-          # Common Intel / Realtek / Broadcom / Mellanox adapters.
-          # ==========================================================
-          #
-
+          # Intel Ethernet
           CONFIG_PACKAGE_kmod-e1000=y
           CONFIG_PACKAGE_kmod-e1000e=y
           CONFIG_PACKAGE_kmod-igb=y
@@ -516,182 +322,86 @@ jobs:
           CONFIG_PACKAGE_kmod-iavf=y
           CONFIG_PACKAGE_kmod-ice=y
 
+          # Realtek Ethernet
           CONFIG_PACKAGE_kmod-r8169=y
 
+          # Broadcom Ethernet
           CONFIG_PACKAGE_kmod-tg3=y
           CONFIG_PACKAGE_kmod-bnx2=y
           CONFIG_PACKAGE_kmod-bnx2x=y
 
+          # Marvell / SysKonnect
           CONFIG_PACKAGE_kmod-sky2=y
 
+          # Mellanox
           CONFIG_PACKAGE_kmod-mlx4-core=y
           CONFIG_PACKAGE_kmod-mlx5-core=y
 
-
-          #
-          # ==========================================================
-          # KVM / QEMU guest drivers
-          #
-          # These are the important drivers when OpenWrt itself is
-          # running inside PVE / KVM / QEMU.
-          # ==========================================================
-          #
-
+          # KVM / QEMU guest
           CONFIG_PACKAGE_kmod-virtio=y
           CONFIG_PACKAGE_kmod-virtio-pci=y
           CONFIG_PACKAGE_kmod-virtio-net=y
           CONFIG_PACKAGE_kmod-virtio-balloon=y
           CONFIG_PACKAGE_kmod-virtio-rng=y
 
-
-          #
-          # ==========================================================
           # VMware / ESXi
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_kmod-vmxnet3=y
 
-
-          #
-          # ==========================================================
           # Hyper-V
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_kmod-hv-vmbus=y
           CONFIG_PACKAGE_kmod-hv-netvsc=y
           CONFIG_PACKAGE_kmod-hv-utils=y
 
-
-          #
-          # ==========================================================
-          # Useful x86 hardware support
-          # ==========================================================
-          #
-
+          # CPU microcode
           CONFIG_PACKAGE_amd64-microcode=y
           CONFIG_PACKAGE_intel-microcode=y
 
-
-          #
-          # ==========================================================
-          # USB / hardware monitoring
-          # ==========================================================
-          #
-
+          # Hardware monitoring
           CONFIG_PACKAGE_kmod-usb-core=y
-          CONFIG_PACKAGE_kmod-hwmon-core=y
-
-
-          #
-          # ==========================================================
-          # Basic tools
-          # ==========================================================
-          #
-
           CONFIG_PACKAGE_ethtool=y
-
 
           EOF
 
-          # Let OpenWrt resolve all dependencies against the current
-          # 25.12 source tree and current feeds.
-
           make defconfig
 
+      # ==========================================================
+      # Verify configuration
+      # ==========================================================
 
-      # ============================================================
-      # 12. Verify package availability
-      # ============================================================
-
-      - name: Verify package configuration
+      - name: Verify configuration
         working-directory: openwrt
         shell: bash
         run: |
           set -eux
 
-          echo "=================================================="
-          echo "Target"
-          echo "=================================================="
-
-          grep -E \
-            '^CONFIG_TARGET_x86|^CONFIG_TARGET_ARCH_PACKAGES' \
-            .config || true
-
+          echo "===== Target ====="
+          grep '^CONFIG_TARGET_x86' .config || true
 
           echo
-          echo "=================================================="
-          echo "LuCI / Chinese"
-          echo "=================================================="
-
-          grep -E \
-            '^CONFIG_(LUCI_LANG_zh_Hans|PACKAGE_luci-theme-bootstrap|PACKAGE_luci-i18n-)' \
-            .config || true
-
+          echo "===== LuCI ====="
+          grep '^CONFIG_PACKAGE_luci' .config || true
 
           echo
-          echo "=================================================="
-          echo "Requested applications"
-          echo "=================================================="
-
-          grep -E \
-            '^CONFIG_PACKAGE_(luci-app-ttyd|miniupnpd-nftables|luci-app-upnp|ddns-scripts|luci-app-ddns|ddns-scripts-cloudflare|ddns-scripts-dnspod|curl|ca-certificates|luci-app-uhttpd|luci-app-statistics|collectd-mod-thermal|kmod-thermal|kmod-hwmon-core|ddnsto|luci-app-ddnsto|luci-app-openclash|luci-app-homeproxy|luci-app-cpu-status-mini)' \
-            .config || true
-
+          echo "===== Chinese ====="
+          grep '^CONFIG_.*zh_' .config || true
 
           echo
-          echo "=================================================="
-          echo "Virtual machine drivers"
-          echo "=================================================="
-
+          echo "===== Applications ====="
           grep -E \
-            '^CONFIG_PACKAGE_(kmod-virtio|kmod-virtio-pci|kmod-virtio-net|kmod-virtio-balloon|kmod-virtio-rng|kmod-vmxnet3|kmod-hv-vmbus|kmod-hv-netvsc|kmod-hv-utils)' \
+            'CONFIG_PACKAGE_(luci-app-openclash|luci-app-homeproxy|luci-app-cpu-status-mini|ddnsto|luci-app-ddnsto|luci-app-ttyd|luci-app-upnp|luci-app-ddns|luci-app-uhttpd|luci-app-statistics)' \
             .config || true
 
-
           echo
-          echo "=================================================="
-          echo "Physical NIC drivers"
-          echo "=================================================="
-
+          echo "===== Virtual machine drivers ====="
           grep -E \
-            '^CONFIG_PACKAGE_(kmod-e1000|kmod-e1000e|kmod-igb|kmod-igc|kmod-ixgbe|kmod-ixgbevf|kmod-i40e|kmod-iavf|kmod-ice|kmod-r8169|kmod-tg3|kmod-bnx2|kmod-bnx2x|kmod-sky2|kmod-mlx4-core|kmod-mlx5-core)' \
+            'CONFIG_PACKAGE_(kmod-virtio|kmod-virtio-pci|kmod-virtio-net|kmod-virtio-balloon|kmod-virtio-rng|kmod-vmxnet3|kmod-hv-vmbus|kmod-hv-netvsc|kmod-hv-utils)' \
             .config || true
 
+      # ==========================================================
+      # Download sources
+      # ==========================================================
 
-      # ============================================================
-      # 13. Show third-party package locations
-      # ============================================================
-
-      - name: Verify third-party package trees
-        working-directory: openwrt
-        shell: bash
-        run: |
-          set -eux
-
-          echo "===== OpenClash ====="
-          test -f package/openclash/luci-app-openclash/Makefile
-
-          echo "===== HomeProxy ====="
-          test -f package/homeproxy/Makefile
-
-          echo "===== CPU Status Mini ====="
-          test -f package/cpu-status-mini/Makefile
-
-          echo "===== DDNSTO ====="
-          test -f package/feeds/kenzo/ddnsto/Makefile
-          test -f package/feeds/kenzo/luci-app-ddnsto/Makefile
-
-          echo
-          echo "Third-party package trees verified."
-
-
-      # ============================================================
-      # 14. Download all source archives
-      # ============================================================
-
-      - name: Download package sources
+      - name: Download sources
         working-directory: openwrt
         shell: bash
         run: |
@@ -699,10 +409,9 @@ jobs:
 
           make download -j"$(nproc)" V=s
 
-
-      # ============================================================
-      # 15. Compile
-      # ============================================================
+      # ==========================================================
+      # Build
+      # ==========================================================
 
       - name: Compile OpenWrt
         working-directory: openwrt
@@ -712,10 +421,9 @@ jobs:
 
           make -j"$(nproc)" V=s
 
-
-      # ============================================================
-      # 16. Generate build information
-      # ============================================================
+      # ==========================================================
+      # Build information
+      # ==========================================================
 
       - name: Generate build information
         working-directory: openwrt
@@ -726,87 +434,24 @@ jobs:
           mkdir -p build-info
 
           {
-            echo "=================================================="
-            echo "OpenWrt Build Information"
-            echo "=================================================="
+            echo "OpenWrt branch: ${OPENWRT_BRANCH}"
+            echo "Build date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "OpenWrt commit: $(git rev-parse HEAD)"
+            echo "OpenWrt description: $(git describe --always 2>/dev/null || true)"
             echo
-
-            echo "Build date:"
-            date -u '+%Y-%m-%d %H:%M:%S UTC'
-            echo
-
-            echo "OpenWrt branch:"
-            echo "${OPENWRT_BRANCH}"
-            echo
-
-            echo "OpenWrt commit:"
-            git rev-parse HEAD
-            echo
-
-            echo "OpenWrt description:"
-            git describe --always --dirty || true
-            echo
-
             echo "OpenClash commit:"
             git -C package/openclash rev-parse HEAD
             echo
-
             echo "HomeProxy commit:"
             git -C package/homeproxy rev-parse HEAD
             echo
-
             echo "CPU Status Mini commit:"
             git -C package/cpu-status-mini rev-parse HEAD
-            echo
-
-            echo "=================================================="
-            echo "Target configuration"
-            echo "=================================================="
-
-            grep '^CONFIG_TARGET_' .config | sort || true
-
-            echo
-            echo "=================================================="
-            echo "Selected packages"
-            echo "=================================================="
-
-            grep '^CONFIG_PACKAGE_.*=y' .config | sort || true
-
           } > build-info/build-info.txt
 
-
-      # ============================================================
-      # 17. Show firmware files
-      # ============================================================
-
-      - name: List firmware files
-        working-directory: openwrt
-        shell: bash
-        run: |
-          set -eux
-
-          echo "=================================================="
-          echo "Firmware files"
-          echo "=================================================="
-
-          find bin/targets/x86/64 \
-            -type f \
-            -print | sort
-
-
-          echo
-          echo "=================================================="
-          echo "Firmware sizes"
-          echo "=================================================="
-
-          du -h \
-            bin/targets/x86/64/* \
-            2>/dev/null || true
-
-
-      # ============================================================
-      # 18. Prepare GitHub Artifact
-      # ============================================================
+      # ==========================================================
+      # Prepare artifact
+      # ==========================================================
 
       - name: Prepare artifact
         working-directory: openwrt
@@ -817,26 +462,17 @@ jobs:
           rm -rf ../artifact
           mkdir -p ../artifact
 
-          cp -a \
-            bin/targets/x86/64/. \
-            ../artifact/
+          cp -a bin/targets/x86/64/. ../artifact/
 
           mkdir -p ../artifact/build-info
+          cp build-info/build-info.txt ../artifact/build-info/
 
-          cp -a \
-            build-info/build-info.txt \
-            ../artifact/build-info/
+          echo "===== Artifact ====="
+          find ../artifact -type f -print | sort
 
-          echo "Artifact contents:"
-          find ../artifact \
-            -maxdepth 3 \
-            -type f \
-            -print | sort
-
-
-      # ============================================================
-      # 19. Upload firmware
-      # ============================================================
+      # ==========================================================
+      # Upload artifact
+      # ==========================================================
 
       - name: Upload OpenWrt firmware
         uses: actions/upload-artifact@v6
@@ -846,4 +482,3 @@ jobs:
           if-no-files-found: error
           compression-level: 6
           retention-days: 30
-```
