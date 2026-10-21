@@ -1,0 +1,511 @@
+# ============================================================
+# OpenWrt 25.12 SNAPSHOT x86/64 固件编译工作流
+# 触发方式: 仅手动触发 (workflow_dispatch)
+# ============================================================
+
+name: OpenWrt 25.12 SNAPSHOT x86_64 Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: '启用调试模式 (慢速但详细)'
+        type: boolean
+        default: false
+      branch:
+        description: 'OpenWrt 分支 (默认 openwrt-25.12)'
+        type: string
+        default: 'openwrt-25.12'
+
+env:
+  TZ: Asia/Shanghai
+  DEBIAN_FRONTEND: noninteractive
+  # OpenWrt 源码仓库
+  OPENWRT_REPO: https://github.com/openwrt/openwrt.git
+  # 第三方项目仓库
+  DDNSTO_BIN_URL: https://fw.koolcenter.com/binary/ddnsto/openwrt/x86_64/ddnsto
+  SONIC_FULLCONE_REPO: https://github.com/mufeng05/openwrt-sonic-fullcone.git
+  OPENCLASH_REPO: https://github.com/vernesong/OpenClash.git
+  HOMEPROXY_REPO: https://github.com/immortalwrt/homeproxy.git
+  CPU_STATUS_MINI_REPO: https://github.com/gSpotx2f/luci-app-cpu-status-mini.git
+
+jobs:
+  build:
+    name: Build OpenWrt 25.12 SNAPSHOT
+    runs-on: ubuntu-24.04
+
+    steps:
+    # ============================================================
+    # Step 1: 检出工作区
+    # ============================================================
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    # ============================================================
+    # Step 2: 安装系统依赖
+    # ============================================================
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential compiler-libc-dev libc6-dev libncurses5-dev \
+          libssl-dev python3 python3-pip python3-setuptools python3-wheel \
+          python3-yaml rsync xz-utils unzip libfile-fcntllock-perl \
+          libxml-parser-perl gawk ccache libelf-dev libgmp3-dev \
+          libmpc-dev libmpfr-dev texinfo libtool wget curl git patchelf \
+          jq bison flex python3-distutils python3-dev python3-ply \
+          libncurses5-dev dfu-util usbutils libusb-1.0-0-dev \
+          gettext python3-click python3-mako python3-lxml \
+          python3-requests python3-six python3-jinja2 \
+          libgdbm-dev libsqlite3-dev zlib1g-dev libbz2-dev \
+          libreadline-dev libncursesw5-dev llvm clang \
+          libpython3-dev pkg-config
+        sudo apt-get clean
+        sudo rm -rf /var/lib/apt/lists/*
+
+    # ============================================================
+    # Step 3: 克隆 OpenWrt 官方源码
+    # ============================================================
+    - name: Clone OpenWrt source
+      run: |
+        git clone --depth 1 $OPENWRT_REPO openwrt
+        cd openwrt
+        BRANCH="${{ github.event.inputs.branch || 'openwrt-25.12' }}"
+        echo "Attempting to checkout branch: $BRANCH"
+        if git fetch origin "$BRANCH" --depth 1 2>/dev/null; then
+          git checkout "$BRANCH"
+        else
+          echo "Branch $BRANCH not found, trying main..."
+          git checkout main
+        fi
+        echo "OpenWrt version: $(cat version 2>/dev/null || echo 'snapshot')"
+
+    # ============================================================
+    # Step 4: 更新 feeds 并安装
+    # ============================================================
+    - name: Update feeds
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    # ============================================================
+    # Step 5: 集成 sonic-fullcone 内核补丁
+    # 参考: https://github.com/mufeng05/openwrt-sonic-fullcone
+    # ============================================================
+    - name: Integrate sonic-fullcone
+      run: |
+        cd openwrt
+        git clone --depth 1 $SONIC_FULLCONE_REPO tmp/sonic-fullcone
+        cd tmp/sonic-fullcone
+
+        KERNEL_VER=$(grep 'CONFIG_KERNEL_VERSION' ../.config 2>/dev/null | cut -d'"' -f2 | cut -d'.' -f1,2)
+        echo "Detected kernel version: $KERNEL_VER"
+
+        # 复制内核补丁到对应版本目录 (支持 6.6/6.12/6.18)
+        for kv in 6.6 6.12 6.18; do
+          if [ -d ../target/linux/generic/hack-$kv ]; then
+            echo "Applying patches for kernel $kv"
+            cp kernel/984-add-sonic-fullcone-support.patch target/linux/generic/hack-$kv/
+            cp kernel/985-add-sonic-fullcone-to-ipt.patch target/linux/generic/hack-$kv/
+            cp kernel/986-add-sonic-fullcone-to-nft.patch target/linux/generic/hack-$kv/
+            break
+          fi
+        done
+
+        # 复制 iptables 补丁
+        if [ -d ../package/network/utils/iptables/patches ]; then
+          cp patches/iptables/901-sonic-fullcone.patch package/network/utils/iptables/patches/
+        fi
+
+        # 复制 firewall4 补丁
+        if [ -d ../package/network/config/firewall4 ]; then
+          mkdir -p package/network/config/firewall4/patches/
+          cp patches/firewall4/001-sonic-fullcone.patch package/network/config/firewall4/patches/ 2>/dev/null || true
+        fi
+
+        # 复制 firewall3 补丁
+        if [ -d ../package/network/config/firewall ]; then
+          mkdir -p package/network/config/firewall/patches/
+          cp patches/firewall3/001-sonic-fullcone.patch package/network/config/firewall/patches/ 2>/dev/null || true
+        fi
+
+        # 复制 luci-app-firewall 补丁
+        if [ -d ../feeds/luci/applications/luci-app-firewall ]; then
+          mkdir -p feeds/luci/applications/luci-app-firewall/patches/
+          cp patches/luci-app-firewall/001-add-fullcone-options.patch feeds/luci/applications/luci-app-firewall/patches/ 2>/dev/null || true
+        fi
+
+        # 为 libnftnl 添加 PKG_FIXUP:=autoreconf (修复 OpenWrt 25.12 编译失败)
+        if [ -f ../package/libs/libnftnl/Makefile ]; then
+          if ! grep -q 'PKG_FIXUP:=autoreconf' ../package/libs/libnftnl/Makefile; then
+            echo 'PKG_FIXUP:=autoreconf' >> ../package/libs/libnftnl/Makefile
+            echo "Added PKG_FIXUP:=autoreconf to libnftnl"
+          fi
+        fi
+
+        cd ../..
+        rm -rf tmp/sonic-fullcone
+
+    # ============================================================
+    # Step 6: 集成 DDNSTO 包
+    # 参考: https://doc.linkease.com/zh/guide/ddnsto/developer/integration-guide.html
+    # 关键: 默认关闭状态，由用户手动启用并填入token
+    # ============================================================
+    - name: Integrate DDNSTO package
+      run: |
+        cd openwrt
+
+        # 创建 DDNSTO 包目录结构
+        mkdir -p package/ddnsto/root/usr/bin
+        mkdir -p package/ddnsto/root/etc/config
+        mkdir -p package/ddnsto/root/etc/init.d
+        mkdir -p package/ddnsto/root/etc/ddnsto
+        mkdir -p package/ddnsto/root/usr/share/rpcd/acl.d
+
+        # 下载 DDNSTO 预编译二进制文件
+        echo "Downloading DDNSTO binary..."
+        HTTP_CODE=$(curl -sL --connect-timeout 15 --max-time 60 -o package/ddnsto/root/usr/bin/ddnsto "$DDNSTO_BIN_URL" -w "%{http_code}")
+        if [ "$HTTP_CODE" = "200" ] && [ -s package/ddnsto/root/usr/bin/ddnsto ]; then
+          chmod +x package/ddnsto/root/usr/bin/ddnsto
+          echo "DDNSTO binary downloaded successfully"
+        else
+          echo "WARNING: DDNSTO download failed (HTTP $HTTP_CODE), creating fallback script"
+          cat > package/ddnsto/root/usr/bin/ddnsto << 'EOF'
+#!/bin/sh
+echo "ERROR: DDNSTO binary not available. Download from:"
+echo "https://fw.koolcenter.com/binary/ddnsto/openwrt/x86_64/ddnsto"
+exit 1
+EOF
+          chmod +x package/ddnsto/root/usr/bin/ddnsto
+        fi
+
+        # 创建 Makefile
+        # 注意: root/ 目录下的文件会被 OpenWrt 构建系统自动安装
+        cat > package/ddnsto/Makefile << 'EOF'
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=ddnsto
+PKG_VERSION:=3.0.0
+PKG_RELEASE:=1
+
+PKG_BUILD_DIR := $(BUILD_DIR)/$(PKG_NAME)
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/ddnsto
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=DDNSTO - Intranet Penetration Client
+  DEPENDS:=+libc +curl +ca-certificates
+  URL:=https://www.ddnsto.com/
+  PKGARCH:=all
+endef
+
+define Package/ddnsto/description
+  DDNSTO is a fast and easy-to-use intranet penetration tool for OpenWrt.
+  Compiled into firmware, disabled by default. Users must manually enable via LuCI.
+endef
+
+define Package/ddnsto/conffiles
+/etc/config/ddnsto
+endef
+
+# root/ 目录下的文件会被 OpenWrt 构建系统自动安装到目标根文件系统
+$(eval $(call BuildPackage,ddnsto))
+EOF
+
+        # 创建 DDNSTO UCI 配置文件 (默认 token 为空 = 关闭状态)
+        cat > package/ddnsto/root/etc/config/ddnsto << 'EOF'
+config config
+    option token ''
+    option device_name 'OpenWrt'
+    option server 'tunnel.ddnsto.com'
+    option log_level 'info'
+EOF
+
+        # 创建 DDNSTO init 脚本 (使用 procd，默认不启用)
+        cat > package/ddnsto/root/etc/init.d/ddnsto << 'EOF'
+#!/bin/sh /etc/rc.common
+# DDNSTO init script - disabled by default
+# User must enable via LuCI or uci command
+
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+    local token
+    token=$(uci get ddnsto.config.token 2>/dev/null)
+    [ -z "$token" ] && return 1
+
+    procd_open_instance
+    procd_set_param command /usr/bin/ddnsto
+    procd_append_param command -t "$token"
+    procd_set_param respawn
+    procd_set_param respawn_threshold 300
+    procd_close_instance
+}
+
+stop_service() {
+    killall ddnsto 2>/dev/null
+    return 0
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+reload() {
+    killall -HUP ddnsto 2>/dev/null
+}
+EOF
+        chmod +x package/ddnsto/root/etc/init.d/ddnsto
+
+        # 创建 rpcd ACL 配置
+        cat > package/ddnsto/root/usr/share/rpcd/acl.d/ddnsto.json << 'EOF'
+{
+    "ddnsto": {
+        "description": "Grant UCI access for ddnsto",
+        "read": { "uci": [ "ddnsto" ] },
+        "write": { "uci": [ "ddnsto" ] },
+        "file": { "/usr/bin/ddnsto": [ "exec" ] }
+    }
+}
+EOF
+
+        echo "DDNSTO package created successfully"
+        ls -la package/ddnsto/
+
+    # ============================================================
+    # Step 7: 集成 OpenClash
+    # 参考: https://github.com/vernesong/OpenClash
+    # ============================================================
+    - name: Integrate OpenClash
+      run: |
+        cd openwrt
+        mkdir -p package/luci-app-openclash
+        cd package/luci-app-openclash
+        git init
+        git remote add -f origin $OPENCLASH_REPO
+        git config core.sparsecheckout true
+        echo "luci-app-openclash" >> .git/info/sparse-checkout
+        git pull --depth 1 origin master 2>/dev/null || git pull --depth 1 origin main
+        if [ -d luci-app-openclash ]; then
+          mv luci-app-openclash/* luci-app-openclash/.* . 2>/dev/null || true
+          rmdir luci-app-openclash 2>/dev/null || true
+        fi
+        cd ../..
+        echo "OpenClash integrated"
+
+    # ============================================================
+    # Step 8: 集成 homeproxy
+    # 参考: https://github.com/immortalwrt/homeproxy
+    # ============================================================
+    - name: Integrate homeproxy
+      run: |
+        cd openwrt
+        git clone --depth 1 $HOMEPROXY_REPO package/homeproxy
+        echo "homeproxy integrated"
+
+    # ============================================================
+    # Step 9: 集成 luci-app-cpu-status-mini
+    # 参考: https://github.com/gSpotx2f/luci-app-cpu-status-mini
+    # ============================================================
+    - name: Integrate luci-app-cpu-status-mini
+      run: |
+        cd openwrt
+        git clone --depth 1 $CPU_STATUS_MINI_REPO package/luci-app-cpu-status-mini
+        echo "luci-app-cpu-status-mini integrated"
+
+    # ============================================================
+    # Step 10: 重新安装 feeds
+    # ============================================================
+    - name: Reinstall feeds
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    # ============================================================
+    # Step 11: 配置 OpenWrt
+    # - LAN IP: 192.168.15.1/24
+    # - 主题: bootstrap
+    # - 语言: 简体中文 (兼容 zh-cn / zh_Hans)
+    # ============================================================
+    - name: Configure OpenWrt
+      run: |
+        cd openwrt
+        make defconfig
+
+        # 配置 LAN 地址为 192.168.15.1/24
+        sed -i 's/CONFIG_TARGET_IPADDR="192.168.1.1"/CONFIG_TARGET_IPADDR="192.168.15.1"/g' .config 2>/dev/null || true
+        sed -i 's/CONFIG_TARGET_GW_IPADDR="192.168.1.1"/CONFIG_TARGET_GW_IPADDR="192.168.15.1"/g' .config 2>/dev/null || true
+
+        # 修改 base-files 中的网络配置
+        find target/linux/x86 -name "network" -path "*/base-files/*" -exec sed -i 's/192.168.1.1/192.168.15.1/g' {} \; 2>/dev/null || true
+
+        # 确保使用 bootstrap 主题
+        sed -i 's/# CONFIG_PACKAGE_luci-theme-bootstrap is not set/CONFIG_PACKAGE_luci-theme-bootstrap=y/' .config 2>/dev/null || true
+        sed -i 's/CONFIG_PACKAGE_luci-theme-bootstrap=n/CONFIG_PACKAGE_luci-theme-bootstrap=y/' .config 2>/dev/null || true
+
+        # 启用简体中文 (OpenWrt 25.12 注意: 语言包命名可能有变化)
+        # 同时尝试 zh_cn, zh-cn, zh_Hans, zh_hans 等多种命名
+        for lang in zh_cn zh-cn zh_Hans zh_hans; do
+          sed -i "s/# CONFIG_PACKAGE_luci-i18n-base-${lang} is not set/CONFIG_PACKAGE_luci-i18n-base-${lang}=y/" .config 2>/dev/null || true
+          sed -i "s/CONFIG_PACKAGE_luci-i18n-base-${lang}=n/CONFIG_PACKAGE_luci-i18n-base-${lang}=y/" .config 2>/dev/null || true
+        done
+
+        cp .config .config.backup
+        echo "Configuration done"
+
+    # ============================================================
+    # Step 12: 手动选择编译包
+    # ============================================================
+    - name: Select packages
+      run: |
+        cd openwrt
+
+        # 需要启用的包列表
+        PACKAGES="\
+          luci luci-base luci-proto-ipv6 luci-proto-ppp \
+          luci-theme-bootstrap \
+          luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn \
+          luci-app-ttyd miniupnpd-nftables luci-app-upnp \
+          luci-i18n-upnp-zh-cn ddns-scripts luci-app-ddns \
+          ddns-scripts-cloudflare ddns-scripts-dnspod \
+          curl ca-certificates luci-i18n-ddns-zh-cn \
+          luci-app-uhttpd luci-i18n-uhttpd-zh-cn \
+          luci-app-statistics collectd-mod-thermal \
+          kmod-thermal kmod-hwmon-core luci-i18n-statistics-zh-cn \
+          ddnsto sonic-fullcone luci-app-cpu-status-mini \
+          luci-app-openclash luci-app-homeproxy \
+          luci-i18n-homeproxy-zh-cn \
+          kmod-nft-offload kmod-nat46 kmod-tun kmod-inet-diag \
+          kmod-ipt-nat kmod-ipt-nat6 kmod-ipt-offload \
+          iptables-mod-nat iptables-mod-extra dnsmasq-full \
+          ip-full ipset bash htop tmux net-tools \
+          iputils-ping iputils-tracepath nslookup wget-ssl \
+          rsync scp sshfs-client openssh-sftp-client \
+          fdisk lsblk parted e2fsprogs ntfs-3g \
+          kmod-usb-storage kmod-fs-ext4 kmod-fs-ntfs \
+          kmod-fs-vfat kmod-fs-exfat kmod-usb3 kmod-usb2 \
+          kmod-usb-core kmod-ehci-hcd kmod-ohci-hcd kmod-uhci-hcd \
+          "
+
+        # 物理网卡驱动
+        NIC_DRIVERS="\
+          kmod-e1000e kmod-igb kmod-ixgbe kmod-i40e \
+          kmod-i40evf kmod-ice kmod-mlx4-core kmod-mlx5-core \
+          kmod-r8169 kmod-r8125 kmod-r8101 kmod-8139cp \
+          kmod-8139too kmod-tg3 kmod-bnx2 kmod-bnx2x \
+          kmod-be2net kmod-sfc kmod-via-velocity kmod-alx \
+          kmod-atlantic kmod-aquantia kmod-sky2 kmod-macvlan kmod-vlan \
+          "
+
+        # 虚拟机/虚拟化驱动
+        VM_DRIVERS="\
+          kmod-kvm kmod-kvm-amd kmod-kvm-intel \
+          kmod-virtio kmod-virtio-pci kmod-virtio-net \
+          kmod-virtio-blk kmod-virtio-scsi kmod-virtio-balloon \
+          kmod-virtio-console kmod-vhost-net kmod-vhost-vsock \
+          kmod-vhost-crypto \
+          "
+
+        # 启用所有包
+        for pkg in $PACKAGES $NIC_DRIVERS $VM_DRIVERS; do
+          sed -i "s/# CONFIG_PACKAGE_${pkg} is not set/CONFIG_PACKAGE_${pkg}=y/" .config 2>/dev/null || true
+          sed -i "s/CONFIG_PACKAGE_${pkg}=n/CONFIG_PACKAGE_${pkg}=y/" .config 2>/dev/null || true
+        done
+
+        # 确保 x86_64 目标被选中
+        sed -i 's/# CONFIG_TARGET_x86_64 is not set/CONFIG_TARGET_x86_64=y/' .config 2>/dev/null || true
+        sed -i 's/CONFIG_TARGET_x86_64=n/CONFIG_TARGET_x86_64=y/' .config 2>/dev/null || true
+
+        echo "Package selection done"
+        grep 'CONFIG_PACKAGE_luci' .config | head -15
+
+    # ============================================================
+    # Step 13: 最终配置验证
+    # ============================================================
+    - name: Final configuration check
+      run: |
+        cd openwrt
+        make defconfig 2>&1 | tail -5
+
+        echo "=== Key Configuration ==="
+        grep 'CONFIG_TARGET_x86' .config | head -3 || echo "WARN: x86 target"
+        grep 'CONFIG_PACKAGE_luci-theme-bootstrap' .config || echo "WARN: bootstrap theme"
+        grep 'CONFIG_PACKAGE_luci-i18n-base-zh' .config || echo "WARN: Chinese lang"
+        grep 'CONFIG_PACKAGE_luci-app-openclash' .config || echo "WARN: OpenClash"
+        grep 'CONFIG_PACKAGE_luci-app-homeproxy' .config || echo "WARN: homeproxy"
+        grep 'CONFIG_PACKAGE_ddnsto' .config || echo "WARN: ddnsto"
+        grep 'CONFIG_PACKAGE_sonic-fullcone' .config || echo "WARN: sonic-fullcone"
+        grep 'CONFIG_PACKAGE_luci-app-cpu-status-mini' .config || echo "WARN: cpu-status"
+
+    # ============================================================
+    # Step 14: 下载依赖包
+    # ============================================================
+    - name: Download packages
+      run: |
+        cd openwrt
+        make download -j$(nproc) NO_CHECKSUM=1 2>&1 | tail -10 || \
+        make download -j1 NO_CHECKSUM=1 2>&1 | tail -10
+        echo "Download complete"
+
+    # ============================================================
+    # Step 15: 编译固件
+    # ============================================================
+    - name: Build firmware
+      run: |
+        cd openwrt
+        make -j$(nproc) 2>&1 | tee build.log || \
+        {
+          echo "Parallel build failed, retrying single thread..."
+          make -j1 V=s 2>&1 | tee build.log.single
+        }
+        echo "Build complete"
+
+    # ============================================================
+    # Step 16: 整理编译产物
+    # ============================================================
+    - name: Prepare artifacts
+      run: |
+        cd openwrt
+        mkdir -p ../output
+        find bin/targets/ -type f \( -name "*.img.gz" -o -name "*.ext4" -o -name "*.raw" -o -name "*.bin" \) -exec cp {} ../output/ \;
+        find bin/packages/ -name "*.ipk" -exec cp {} ../output/ 2>/dev/null \; || true
+        find bin/feeds/ -name "*.ipk" -exec cp {} ../output/ 2>/dev/null \; || true
+        cp build.log ../output/ 2>/dev/null || true
+        cp build.log.single ../output/ 2>/dev/null || true
+        cp .config ../output/.config 2>/dev/null || true
+        cp .config.backup ../output/.config.backup 2>/dev/null || true
+
+        echo "=== Output files ==="
+        ls -la ../output/
+
+    # ============================================================
+    # Step 17: 上传构建产物
+    # ============================================================
+    - name: Upload firmware
+      uses: actions/upload-artifact@v6
+      with:
+        name: openwrt-25.12-snapshot-x86-64
+        path: |
+          openwrt/../output/
+        retention-days: 14
+        if-no-files-found: warn
+
+    # ============================================================
+    # Step 18: 上传完整构建目录 (可选)
+    # ============================================================
+    - name: Upload build directory (optional)
+      if: github.event.inputs.debug == 'true'
+      uses: actions/upload-artifact@v6
+      with:
+        name: openwrt-build-dir
+        path: |
+          openwrt/build_dir/
+        retention-days: 7
