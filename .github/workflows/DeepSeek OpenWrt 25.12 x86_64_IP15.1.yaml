@@ -1,0 +1,200 @@
+name: DeepSeek OpenWrt 25.12 x86_64_IP15.1
+
+on:
+  workflow_dispatch:   # 仅手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" /usr/local/graalvm
+          sudo apt-get clean
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ccache ecj fastjar file g++ gawk \
+            gettext git java-propose-classpath libelf-dev libncurses5-dev \
+            libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
+            python3-pyelftools rsync subversion swig time unzip wget xsltproc zlib1g-dev
+
+      # 1. 克隆 OpenWrt 25.12-SNAPSHOT 源码
+      - name: Clone OpenWrt source
+        run: |
+          git clone --depth 1 --branch openwrt-25.12 \
+            https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # 2. 注入 sonic-fullcone 内核补丁（必须在 feeds install 之后执行）
+      - name: Apply sonic-fullcone patch
+        run: |
+          cd openwrt
+          curl -sSL https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
+          # 脚本自动检测内核版本、复制补丁、修改 libnftnl Makefile，无需 menuconfig 勾选
+
+      # 3. 克隆外部包源（DDNSTO、CPU 状态、OpenClash、HomeProxy）
+      - name: Add external packages
+        run: |
+          cd openwrt
+
+          # DDNSTO（kenzok8 源）
+          git clone --depth 1 https://github.com/kenzok8/openwrt-packages.git \
+            package/kenzok8-packages
+
+          # luci-app-cpu-status-mini
+          git clone --depth 1 https://github.com/gSpotx2f/luci-app-cpu-status-mini.git \
+            package/luci-app-cpu-status-mini
+
+          # OpenClash（先移除 feed 中的同名占位包）
+          rm -rf feeds/luci/applications/luci-app-openclash
+          git clone --depth 1 https://github.com/vernesong/OpenClash.git \
+            package/luci-app-openclash
+
+          # HomeProxy（先移除 feed 中的同名占位包）
+          rm -rf feeds/luci/applications/luci-app-homeproxy
+          git clone --depth 1 https://github.com/immortalwrt/homeproxy.git \
+            package/luci-app-homeproxy
+
+      # 4. 生成 .config（所有配置在此内联）
+      - name: Generate .config
+        run: |
+          cd openwrt
+
+          # ---- 4.1 目标平台 ----
+          cat >> .config <<'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_Generic=y
+          EOF
+
+          # ---- 4.2 后台 LAN 地址 192.168.15.1/24 ----
+          sed -i 's/192.168.1.1/192.168.15.1/g' package/base-files/files/bin/config_generate
+
+          # ---- 4.3 默认主题 bootstrap + 默认简体中文 ----
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+          CONFIG_LUCI_MAIN_THEME_BOOTSTRAP=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          EOF
+
+          mkdir -p package/base-files/files/etc/uci-defaults
+          cat > package/base-files/files/etc/uci-defaults/99-default-lang <<'EOF_LANG'
+          uci set luci.main.lang='zh-cn'
+          uci commit luci
+          EOF_LANG
+
+          # ---- 4.4 主流物理网卡 + KVM 虚拟机驱动 ----
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_kmod-e1000=y
+          CONFIG_PACKAGE_kmod-e1000e=y
+          CONFIG_PACKAGE_kmod-igb=y
+          CONFIG_PACKAGE_kmod-igc=y
+          CONFIG_PACKAGE_kmod-ixgbe=y
+          CONFIG_PACKAGE_kmod-i40e=y
+          CONFIG_PACKAGE_kmod-r8169=y
+          CONFIG_PACKAGE_kmod-tg3=y
+          CONFIG_PACKAGE_kmod-bnx2=y
+          CONFIG_PACKAGE_kmod-forcedeth=y
+          CONFIG_PACKAGE_kmod-virtio-net=y
+          CONFIG_PACKAGE_kmod-virtio-pci=y
+          CONFIG_PACKAGE_kmod-vfio-pci=y
+          EOF
+
+          # ---- 4.5 基础工具与网络服务 ----
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-certificates=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_miniupnpd-nftables=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+          CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+          CONFIG_PACKAGE_ddns-scripts-dnspod=y
+          CONFIG_PACKAGE_luci-app-uhttpd=y
+          CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
+          CONFIG_PACKAGE_luci-app-statistics=y
+          CONFIG_PACKAGE_luci-i18n-statistics-zh-cn=y
+          CONFIG_PACKAGE_collectd-mod-thermal=y
+          CONFIG_PACKAGE_kmod-thermal=y
+          CONFIG_PACKAGE_kmod-hwmon-core=y
+          EOF
+
+          # ---- 4.6 DDNSTO（kenzok8 源） ----
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-ddnsto=y
+          CONFIG_PACKAGE_luci-i18n-ddnsto-zh-cn=y
+          EOF
+
+          # ---- 4.7 luci-app-cpu-status-mini ----
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-cpu-status-mini=y
+          EOF
+
+          # ---- 4.8 代理插件 ----
+          # OpenClash
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-openclash=y
+          EOF
+
+          # HomeProxy + 中文包 + 核心依赖
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-homeproxy=y
+          CONFIG_PACKAGE_luci-i18n-homeproxy-zh-cn=y
+          CONFIG_PACKAGE_sing-box=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_ucode-mod-digest=y
+          CONFIG_PACKAGE_firewall4=y
+          EOF
+
+      # 5. defconfig 自动补全依赖
+      - name: Run defconfig
+        run: |
+          cd openwrt
+          make defconfig
+
+      # 6. 下载软件包源码
+      - name: Download package sources
+        run: |
+          cd openwrt
+          make download -j$(nproc) || make download -j1 V=s
+
+      # 7. 编译固件
+      - name: Build firmware
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+
+      # 8. 收集产物
+      - name: Prepare artifacts
+        run: |
+          cd openwrt
+          mkdir -p ../output
+          cp -v bin/targets/x86/64/*.img.gz ../output/ 2>/dev/null || true
+          cp -v bin/targets/x86/64/*.img ../output/ 2>/dev/null || true
+          cp -v bin/targets/x86/64/*.iso ../output/ 2>/dev/null || true
+          cp -v bin/targets/x86/64/config.buildinfo ../output/ 2>/dev/null || true
+          cp -v .config ../output/build.config 2>/dev/null || true
+
+      # 9. 上传产物
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: DeepSeek OpenWrt 25.12 x86_64_IP15.1
+          path: output/
+          retention-days: 30
