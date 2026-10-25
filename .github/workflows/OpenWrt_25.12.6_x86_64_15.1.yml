@@ -1,0 +1,562 @@
+name: OpenWrt 25.12.6 x86_64_15.1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_BRANCH: v25.12.6
+  SONIC_FULLCONE_SCRIPT: https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh
+
+jobs:
+  build:
+    name: Build OpenWrt 25.12.6 x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout OpenWrt 25.12.6
+        uses: actions/checkout@v7
+        with:
+          repository: openwrt/openwrt
+          ref: v25.12.6
+          fetch-depth: 1
+          path: openwrt
+
+      - name: Install Ubuntu 24.04 build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            g++ \
+            gawk \
+            gcc-multilib \
+            g++-multilib \
+            gettext \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            python3 \
+            python3-setuptools \
+            python3-pyelftools \
+            python3-yaml \
+            rsync \
+            swig \
+            unzip \
+            zlib1g-dev \
+            file \
+            wget \
+            curl \
+            ca-certificates \
+            xsltproc \
+            libelf-dev \
+            ecj \
+            fastjar \
+            device-tree-compiler
+          python3 --version
+          git --version
+          gcc --version
+
+      - name: Configure and install feeds
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config --global http.version HTTP/1.1
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 60
+          git config --global fetch.parallel 1
+
+          feeds=(packages luci routing telephony video)
+          for feed in "${feeds[@]}"; do
+            echo "===== Updating feed: ${feed} ====="
+            success=0
+            for attempt in 1 2 3 4 5; do
+              echo "Feed ${feed}: attempt ${attempt}/5"
+              if ./scripts/feeds update "${feed}"; then
+                success=1
+                break
+              fi
+              echo "Feed ${feed} update failed; cleaning incomplete checkout before retry..."
+              rm -rf "feeds/${feed}"
+              sleep $((attempt * 10))
+            done
+            if [ "${success}" -ne 1 ]; then
+              echo "ERROR: failed to update feed '${feed}' after 5 attempts"
+              exit 1
+            fi
+          done
+
+          ./scripts/feeds install -a
+
+      - name: Apply SONiC Fullcone patches
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 4 --retry-all-errors "${SONIC_FULLCONE_SCRIPT}" -o /tmp/add_sonic_fullcone.sh
+          bash /tmp/add_sonic_fullcone.sh
+          rm -f /tmp/add_sonic_fullcone.sh
+
+      - name: Add ImmortalWrt-style CPU status to LuCI Overview
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          STATUS_JS="feeds/luci/modules/luci-mod-status/htdocs/luci-static/resources/view/status/include/10_system.js"
+          STATUS_ACL="feeds/luci/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status-index.json"
+
+          test -f "${STATUS_JS}"
+          test -f "${STATUS_ACL}"
+
+          cat > "${STATUS_JS}" <<'EOF'
+          'use strict';
+
+          'require baseclass';
+          'require fs';
+          'require poll';
+          'require rpc';
+          'require uci';
+
+          var callLuciVersion = rpc.declare({
+              object: 'luci',
+              method: 'getVersion'
+          });
+
+          var callSystemBoard = rpc.declare({
+              object: 'system',
+              method: 'board'
+          });
+
+          var callSystemInfo = rpc.declare({
+              object: 'system',
+              method: 'info'
+          });
+
+          function parseCPUStat(text) {
+              if (typeof text != 'string')
+                  return null;
+
+              var line = text.split('\n').find(function(line) {
+                  return line.indexOf('cpu ') == 0;
+              });
+
+              if (!line)
+                  return null;
+
+              var values = line.trim().split(/\s+/).slice(1).map(Number);
+
+              if (values.length < 4 || values.some(isNaN))
+                  return null;
+
+              var idle = values[3] + (values[4] || 0);
+              var total = values.reduce(function(sum, value) {
+                  return sum + value;
+              }, 0);
+
+              return { idle: idle, total: total };
+          }
+
+          function getCPUUsage() {
+              return L.resolveDefault(fs.read('/proc/stat'), '').then(function(first) {
+                  return new Promise(function(resolve) {
+                      setTimeout(resolve, 250);
+                  }).then(function() {
+                      return L.resolveDefault(fs.read('/proc/stat'), '');
+                  }).then(function(second) {
+                      var a = parseCPUStat(first);
+                      var b = parseCPUStat(second);
+
+                      if (!a || !b)
+                          return null;
+
+                      var total = b.total - a.total;
+                      var idle = b.idle - a.idle;
+
+                      if (total <= 0)
+                          return null;
+
+                      return Math.max(0, Math.min(100,
+                          Math.round((1 - idle / total) * 100)));
+                  });
+              });
+          }
+
+          function getCPUPackageTemp() {
+              return L.resolveDefault(fs.list('/sys/class/thermal'), []).then(function(entries) {
+                  var zones = entries.filter(function(entry) {
+                      return entry && /^thermal_zone[0-9]+$/.test(entry.name);
+                  });
+
+                  return Promise.all(zones.map(function(zone) {
+                      var base = '/sys/class/thermal/' + zone.name;
+
+                      return L.resolveDefault(fs.read(base + '/type'), '').then(function(type) {
+                          if (type.trim() != 'x86_pkg_temp')
+                              return null;
+
+                          return L.resolveDefault(fs.read(base + '/temp'), '').then(function(temp) {
+                              var value = parseInt(String(temp).trim(), 10);
+
+                              if (!isFinite(value))
+                                  return null;
+
+                              return (value / 1000).toFixed(1).replace(/\.0$/, '') + '°C';
+                          });
+                      });
+                  })).then(function(values) {
+                      return values.find(function(value) {
+                          return value !== null;
+                      }) || null;
+                  });
+              });
+          }
+
+          function getMetrics() {
+              return Promise.all([
+                  L.resolveDefault(getCPUUsage(), null),
+                  L.resolveDefault(getCPUPackageTemp(), null)
+              ]).then(function(values) {
+                  return {
+                      cpu: values[0],
+                      temp: values[1]
+                  };
+              });
+          }
+
+          return baseclass.extend({
+              title: _('System'),
+
+              load: function() {
+                  return Promise.all([
+                      L.resolveDefault(callSystemBoard(), {}),
+                      L.resolveDefault(callSystemInfo(), {}),
+                      L.resolveDefault(callLuciVersion(), {
+                          revision: _('unknown version'),
+                          branch: 'LuCI'
+                      }),
+                      uci.load('system'),
+                      L.resolveDefault(getMetrics(), { cpu: null, temp: null })
+                  ]);
+              },
+
+              render: function(data) {
+                  var boardinfo = data[0],
+                      systeminfo = data[1],
+                      luciversion = data[2],
+                      metrics = data[4];
+
+                  luciversion = luciversion.branch + ' ' + luciversion.revision;
+
+                  var datestr = null;
+                  var unixtime = Math.floor(Date.now() / 1000);
+
+                  if (unixtime) {
+                      var date = new Date(unixtime * 1000),
+                          zn = uci.get('system', '@system[0]', 'zonename')?.replaceAll(' ', '_') || 'UTC',
+                          ts = uci.get('system', '@system[0]', 'clock_timestyle') || 0,
+                          hc = uci.get('system', '@system[0]', 'clock_hourcycle') || 0;
+
+                      datestr = new Intl.DateTimeFormat(undefined, {
+                          dateStyle: 'medium',
+                          timeStyle: (ts == 0) ? 'long' : 'full',
+                          hourCycle: (hc == 0) ? undefined : hc,
+                          timeZone: zn
+                      }).format(date);
+                  }
+
+                  var fields = [
+                      _('Hostname'), boardinfo.hostname,
+                      _('Model'), boardinfo.model,
+                      _('Architecture'), boardinfo.system,
+                      _('Target Platform'), (L.isObject(boardinfo.release) ? boardinfo.release.target : ''),
+                      _('Firmware Version'), (L.isObject(boardinfo.release) ? boardinfo.release.description + ' / ' : '') + (luciversion || ''),
+                      _('Kernel Version'), boardinfo.kernel,
+                      _('Local Time'), datestr,
+                      _('Uptime'), systeminfo.uptime ? '%t'.format(systeminfo.uptime) : null,
+                      _('Load Average'), Array.isArray(systeminfo.load) ? '%.2f, %.2f, %.2f'.format(
+                          systeminfo.load[0] / 65535.0,
+                          systeminfo.load[1] / 65535.0,
+                          systeminfo.load[2] / 65535.0
+                      ) : null,
+                      'CPU 使用率', metrics.cpu != null ? metrics.cpu + '%' : '?',
+                      'CPU 温度', metrics.temp != null ? metrics.temp : '?'
+                  ];
+
+                  var table = E('table', { 'class': 'table' });
+                  var cpuCell, tempCell;
+
+                  for (var i = 0; i < fields.length; i += 2) {
+                      var value = (fields[i + 1] != null) ? fields[i + 1] : '?';
+
+                      var cell = E('td', {
+                          'class': 'td left'
+                      }, [ value ]);
+
+                      var row = E('tr', { 'class': 'tr' }, [
+                          E('td', {
+                              'class': 'td left',
+                              'width': '33%'
+                          }, [ fields[i] ]),
+                          cell
+                      ]);
+
+                      table.appendChild(row);
+
+                      if (fields[i] == 'CPU 使用率')
+                          cpuCell = cell;
+                      else if (fields[i] == 'CPU 温度')
+                          tempCell = cell;
+                  }
+
+                  poll.add(function() {
+                      return getMetrics().then(function(next) {
+                          if (next.cpu != null && cpuCell)
+                              cpuCell.textContent = next.cpu + '%';
+
+                          if (next.temp != null && tempCell)
+                              tempCell.textContent = next.temp;
+                      });
+                  }, 5);
+
+                  return table;
+              }
+          });
+          EOF
+
+          python3 - "${STATUS_ACL}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          data = json.loads(path.read_text(encoding="utf-8"))
+
+          group = data.setdefault("luci-mod-status-index", {})
+          read = group.setdefault("read", {})
+          files = read.setdefault("file", {})
+
+          files["/proc/stat"] = ["read"]
+          files["/sys/class/thermal"] = ["list"]
+          files["/sys/class/thermal/thermal_zone*"] = ["list"]
+          files["/sys/class/thermal/thermal_zone*/type"] = ["read"]
+          files["/sys/class/thermal/thermal_zone*/temp"] = ["read"]
+
+          path.write_text(
+              json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8"
+          )
+          PY
+
+          node --check "${STATUS_JS}"
+          python3 -m json.tool "${STATUS_ACL}" >/dev/null
+
+          grep -n -E "getCPUUsage|getCPUPackageTemp|x86_pkg_temp|CPU 使用率|CPU 温度" "${STATUS_JS}"
+          grep -n -E "/proc/stat|thermal_zone.*/type|thermal_zone.*/temp" "${STATUS_ACL}"
+
+      - name: Configure first-boot defaults
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-custom-defaults <<'EOF'
+          #!/bin/sh
+
+          # LAN: 192.168.15.1/24
+          # DHCP server enabled on LAN by default.
+          uci -q set network.lan.ipaddr='192.168.15.1'
+          uci -q set network.lan.netmask='255.255.255.0'
+          uci -q set dhcp.lan.ignore='0'
+
+          # Default LuCI language and Bootstrap theme
+          uci -q set luci.main.lang='zh_cn'
+          uci -q set luci.main.mediaurlbase='/luci-static/bootstrap'
+          uci -q set luci.themes.Bootstrap='/luci-static/bootstrap'
+
+
+          uci -q commit network
+          uci -q commit dhcp
+          uci -q commit luci
+          exit 0
+          EOF
+          chmod 0755 files/etc/uci-defaults/99-custom-defaults
+
+      - name: Generate OpenWrt configuration
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > .config <<'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          CONFIG_TARGET_ROOTFS_PARTSIZE=1024
+
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-base=y
+          CONFIG_PACKAGE_luci-mod-admin-full=y
+          CONFIG_PACKAGE_luci-mod-network=y
+          CONFIG_PACKAGE_luci-mod-status=y
+          CONFIG_PACKAGE_luci-mod-system=y
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-uhttpd-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-statistics-zh-cn=y
+
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_miniupnpd-nftables=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+          CONFIG_PACKAGE_ddns-scripts-dnspod=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-certificates=y
+          CONFIG_PACKAGE_luci-app-uhttpd=y
+
+          CONFIG_PACKAGE_luci-app-statistics=y
+          CONFIG_PACKAGE_collectd-mod-thermal=y
+          CONFIG_PACKAGE_kmod-thermal=y
+          CONFIG_PACKAGE_kmod-hwmon-core=y
+
+
+          # Common physical Ethernet drivers
+          CONFIG_PACKAGE_kmod-e1000=y
+          CONFIG_PACKAGE_kmod-e1000e=y
+          CONFIG_PACKAGE_kmod-igb=y
+          CONFIG_PACKAGE_kmod-igc=y
+          CONFIG_PACKAGE_kmod-ixgbe=y
+          CONFIG_PACKAGE_kmod-ixgbevf=y
+          CONFIG_PACKAGE_kmod-i40e=y
+          CONFIG_PACKAGE_kmod-iavf=y
+          CONFIG_PACKAGE_kmod-ice=y
+          CONFIG_PACKAGE_kmod-r8169=y
+          CONFIG_PACKAGE_kmod-tg3=y
+          CONFIG_PACKAGE_kmod-bnx2=y
+          CONFIG_PACKAGE_kmod-bnx2x=y
+          CONFIG_PACKAGE_kmod-sky2=y
+          CONFIG_PACKAGE_kmod-mlx4-core=y
+          CONFIG_PACKAGE_kmod-mlx5-core=y
+          CONFIG_PACKAGE_kmod-amazon-ena=y
+          CONFIG_PACKAGE_kmod-amd-xgbe=y
+          CONFIG_PACKAGE_kmod-forcedeth=y
+          CONFIG_PACKAGE_kmod-atlantic=y
+
+          # KVM/QEMU/PVE guest drivers (VirtIO)
+          CONFIG_PACKAGE_kmod-virtio=y
+          CONFIG_PACKAGE_kmod-virtio-pci=y
+          CONFIG_PACKAGE_kmod-virtio-net=y
+          CONFIG_PACKAGE_kmod-virtio-balloon=y
+          CONFIG_PACKAGE_kmod-virtio-rng=y
+
+          # VMware and Hyper-V guest drivers
+          CONFIG_PACKAGE_kmod-vmxnet3=y
+          CONFIG_PACKAGE_kmod-hv-vmbus=y
+          CONFIG_PACKAGE_kmod-hv-netvsc=y
+          CONFIG_PACKAGE_kmod-hv-utils=y
+
+          CONFIG_PACKAGE_intel-microcode=y
+          CONFIG_PACKAGE_kmod-usb-core=y
+          CONFIG_PACKAGE_ethtool=y
+          EOF
+
+          make defconfig
+          echo '===== Root filesystem partition size ====='
+          grep '^CONFIG_TARGET_ROOTFS_PARTSIZE=' .config
+          grep -q '^CONFIG_TARGET_ROOTFS_PARTSIZE=1024$' .config
+
+      - name: Verify selected packages
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo '===== Target and partition size ====='
+          grep -E '^CONFIG_TARGET_x86|^CONFIG_TARGET_ROOTFS_PARTSIZE=' .config || true
+          grep -q '^CONFIG_TARGET_ROOTFS_PARTSIZE=1024$' .config
+
+          echo '===== LuCI language and theme ====='
+          grep -E '^CONFIG_(LUCI_LANG_zh_Hans|PACKAGE_luci-theme-bootstrap|PACKAGE_luci-i18n-)' .config || true
+
+          echo '===== Applications ====='
+          grep -E '^CONFIG_PACKAGE_(luci-app-ttyd|miniupnpd-nftables|luci-app-upnp|ddns-scripts|luci-app-ddns|ddns-scripts-cloudflare|ddns-scripts-dnspod|curl|ca-certificates|luci-app-uhttpd|luci-app-statistics|collectd-mod-thermal|kmod-thermal|kmod-hwmon-core)' .config || true
+
+          echo '===== VirtIO / VM ====='
+          grep -E '^CONFIG_PACKAGE_(kmod-virtio|kmod-vmxnet3|kmod-hv-)' .config || true
+
+          echo '===== Ethernet drivers ====='
+          grep -E '^CONFIG_PACKAGE_kmod-(e1000|e1000e|igb|igc|ixgbe|ixgbevf|i40e|iavf|ice|r8169|tg3|bnx2|bnx2x|sky2|mlx4-core|mlx5-core|amazon-ena|amd-xgbe|forcedeth|atlantic)' .config || true
+
+      - name: Download package sources
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          make download -j"$(nproc)" V=s
+
+      - name: Compile OpenWrt
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          make -j"$(nproc)" V=s
+
+      - name: Generate build information
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p build-info
+          {
+            echo "OpenWrt branch: ${OPENWRT_BRANCH}"
+            echo "Build date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "OpenWrt commit: $(git rev-parse HEAD)"
+            echo 'CPU status: native LuCI Overview integration (ImmortalWrt-style), refreshed every 5 seconds'
+            echo 'Root filesystem partition size: 1024 MiB'
+            echo 'LAN: 192.168.15.1/24'
+            echo 'LAN DHCP server: enabled'
+            echo 'LuCI theme: Bootstrap'
+            echo 'LuCI language: zh_cn'
+          } > build-info/build-info.txt
+
+      - name: List firmware outputs
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find bin/targets/x86/64 -maxdepth 2 -type f -print | sort
+          du -h bin/targets/x86/64/* 2>/dev/null || true
+
+      - name: Prepare artifact
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf ../artifact
+          mkdir -p ../artifact/build-info
+          cp -a bin/targets/x86/64/. ../artifact/
+          cp build-info/build-info.txt ../artifact/build-info/
+          find ../artifact -maxdepth 3 -type f -print | sort
+
+      - name: Upload OpenWrt firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenWrt 25.12.6 x86_64_15.1
+          path: artifact/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
